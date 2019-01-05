@@ -24,6 +24,12 @@
 #include "quad_math.h"
 #endif /* _QUAD_MATH_H */
 
+/****************************************************************************/
+
+#ifndef _SPLAY_H
+#include "splay.h"
+#endif /* _SPLAY_H */
+
 /*****************************************************************************/
 
 #ifndef _SMB_FS_SB
@@ -84,9 +90,12 @@ typedef struct dircache
 	int					base;
 	int					len;
 	int					eof;		/* cache end is eof */
+
 	ULONG				created_at;	/* for invalidation */
+
 	struct smba_file *	cache_for;	/* owner of this cache */
 	int					cache_size;
+
 	struct smb_dirent	cache[1];
 } dircache_t;
 
@@ -94,8 +103,18 @@ typedef struct smba_server
 {
 	struct smb_server	server;
 	struct MinList		open_files;
+
+	#ifdef USE_SPLAY_TREE
+
+	struct splay_tree	open_file_address_tree;
+	struct splay_tree	open_file_name_tree;
+
+	#endif /* USE_SPLAY_TREE */
+
 	ULONG				num_open_files;
+
 	dircache_t *		dircache;
+
 	unsigned			supports_E:1;
 	unsigned			supports_E_known:1;
 } smba_server_t;
@@ -103,10 +122,20 @@ typedef struct smba_server
 typedef struct smba_file
 {
 	struct MinNode			node;
+
+	#ifdef USE_SPLAY_TREE
+
+	struct splay_node		splay_address_node;
+	struct splay_node		splay_name_node;
+
+	#endif /* USE_SPLAY_TREE */
+
 	struct smba_server *	server;
+
 	struct smb_dirent		dirent;
 	ULONG					attr_time;		/* time when dirent was read */
 	dircache_t *			dircache;		/* content cache for directories */
+
 	unsigned				is_valid:1;		/* server was down, entry removed, ... */
 	unsigned				attr_dirty:1;	/* attribute cache is dirty */
 } smba_file_t;
@@ -133,7 +162,7 @@ int smba_rmdir(smba_server_t *s, const char *path, int *error_ptr);
 int smba_rename(smba_server_t *s, const char *from, const char *to, int *error_ptr);
 int smba_statfs(smba_server_t *s, long *bsize, long *blocks, long *bfree, int *error_ptr);
 void smb_invalidate_all_inodes(struct smb_server *server);
-int smba_start(const char *service, const char *opt_workgroup, const char *opt_username, const char *opt_password, const char *opt_clientname, const char *opt_servername, int opt_cachesize, int opt_max_transmit, int opt_timeout, int opt_raw_smb, int opt_unicode, int opt_prefer_core_protocol, int opt_case_sensitive, int opt_session_setup_delay_unicode, int opt_write_behind, int *error_ptr, int *smb_error_class_ptr, int *smb_error_ptr, smba_server_t **smba_server_ptr);
+int smba_start(const char *service, const char *opt_workgroup, const char *opt_username, const char *opt_password, const char *opt_clientname, const char *opt_servername, int opt_cachesize, int opt_max_transmit, int opt_timeout, int opt_raw_smb, int opt_unicode, int opt_prefer_core_protocol, int opt_case_sensitive, int opt_session_setup_delay_unicode, int opt_write_behind, int opt_smb_request_write_threshold, int opt_smb_request_read_threshold, int opt_scatter_gather, int opt_tcp_no_delay, int opt_socket_receive_buffer_size, int opt_socket_send_buffer_size, int *error_ptr, int *smb_error_class_ptr, int *smb_error_ptr, smba_connect_parameters_t *smba_connect_par, smba_server_t **smba_server_ptr);
 int smba_get_dircache_size(struct smba_server *server);
 int smba_change_dircache_size(struct smba_server *server, int cache_size);
 

@@ -28,6 +28,15 @@ struct smb_server
 									   data blocks */
 	dword max_raw_size;				/* Maximum SMB_COM_WRITE_RAW and
 									   SMB_COM_READ_RAW data. */
+	dword smb_write_threshold;		/* If SMB header + payload size is smaller
+									   than or equal to this threshold, send
+									   both in a single combined send() operation
+									   rather than separately. */
+	dword smb_read_threshold;		/* Same as above, but for recv() operations. */
+	int scatter_gather;				/* Use sendmsg() rather than send() where useful? */
+	int tcp_no_delay;				/* Disable the Nagle algorithm for send()? */
+	int socket_receive_buffer_size;	/* Desired socket receive buffer size, if > 0. */
+	int socket_send_buffer_size;	/* Desired socket transmit buffer size, if > 0. */
 	int max_recv;					/* added by CS */
 	word server_uid;
 	word tid;

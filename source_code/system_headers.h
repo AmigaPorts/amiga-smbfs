@@ -42,6 +42,10 @@
 
 /*****************************************************************************/
 
+/* The <smb/smb.h> header file declares this, and it may be redefined
+ * in the TCP/IP stack header files. We try to avoid trouble by moving
+ * the type declaration out of the way...
+ */
 #define byte IGNORE_THIS
 
 /*****************************************************************************/

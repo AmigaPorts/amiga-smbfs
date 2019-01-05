@@ -37,6 +37,10 @@
 #include "quad_math.h"
 #endif /* _QUAD_MATH_H */
 
+#ifndef _SPLAY_H
+#include "splay.h"
+#endif /* _SPLAY_H */
+
 /****************************************************************************/
 
 #define SAME (0)
@@ -159,8 +163,8 @@ size_t strlcat(char *dst, const char *src, size_t siz);
 
 /****************************************************************************/
 
-extern void smb_encrypt(unsigned char *passwd, unsigned char *c8, unsigned char *p24);
-extern void smb_nt_encrypt(unsigned char *passwd, unsigned char *c8, unsigned char *p24);
+extern void smb_encrypt(const unsigned char *passwd, const unsigned char *c8, unsigned char *p24);
+extern void smb_nt_encrypt(const unsigned char *passwd, const unsigned char *c8, unsigned char *p24);
 
 /****************************************************************************/
 

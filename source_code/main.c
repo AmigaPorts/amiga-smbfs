@@ -31,6 +31,8 @@
  * Samba 4.6.7: smbfs debuglevel=2 debugfile=ram:ubuntu-17.log volume=ubuntu-test //ubuntu-17-olaf/test
  * Samba 4.7.6: smbfs debuglevel=2 debugfile=ram:ubuntu-18.log volume=ubuntu-test //ubuntu-18-olaf/test
  * Samba 3.0.25: smbfs debuglevel=2 debugfile=ram:samba-3.0.25.log user=olsen password=... volume=olsen //192.168.1.118/olsen
+ *
+ * diskspeed drive olsen:Documents dir seek fast byte nocpu
  */
 
 #include "smbfs.h"
@@ -58,6 +60,18 @@ TEXT Version[] = VERSTAG;
 
 /****************************************************************************/
 
+/* The fully optimized build for SAS/C needs the following
+ * definition because it uses the so-called "small data model"
+ * for accessing local program data.
+ */
+#if defined(__SASC) && DEBUG == 0
+#define SAVE_DS __saveds
+#else
+#define SAVE_DS
+#endif /* __SASC && !DEBUG */
+
+/****************************************************************************/
+
 /* This macro lets us long-align structures on the stack */
 #define D_S(type, name) \
 	UBYTE a_##name[sizeof(type) + 3]; \
@@ -65,55 +79,139 @@ TEXT Version[] = VERSTAG;
 
 /****************************************************************************/
 
+/* Difference between January 1st 1970 and January 1st 1978 in seconds,
+ * which is needed because the Amiga system time base uses 1978 and we
+ * have to deal with Unix time information.
+ */
 #define UNIX_TIME_OFFSET 252460800
+
+/* Maximum length of a file name, as supported by AmigaDOS. */
 #define MAX_FILENAME_LEN 255
 
 /****************************************************************************/
 
+/* This is the root of the SMB directory path, sort of like the
+ * equivalent to ":" as used with AmigaDOS.
+ */
 #define SMB_ROOT_DIR_NAME	"\\"
+
+/* Individual directory/file names are separated by the backslash for SMB
+ * path names (actually, SMB uses the MS-DOS path separator). AmigaDOS
+ * uses the slash.
+ */
 #define SMB_PATH_SEPARATOR	'\\'
 
 /****************************************************************************/
 
-typedef STRPTR	KEY;
-typedef LONG *	NUMBER;
-typedef LONG	SWITCH;
+/* This is for use with the ReadArgs() argument processing. */
+typedef STRPTR	KEY;		/* PARAMETER/K, /A, /F */
+typedef LONG *	NUMBER;		/* PARAMETER/N */
+typedef LONG	SWITCH;		/* PARAMETER/S */
 
 /****************************************************************************/
 
+/* The internal data structure which ties an AmigaDOS FileHandle to the
+ * smbfs representation.
+ */
 struct FileNode
 {
 	struct MinNode		fn_MinNode;
 
-	ULONG				fn_Magic;
+	#ifdef USE_SPLAY_TREE
 
-	struct DosList *	fn_Volume;
+	struct splay_node	fn_SplayNameNode;
+	struct splay_node	fn_SplayAddressNode;
 
-	struct FileHandle *	fn_Handle;
+	#endif /* USE_SPLAY_TREE */
 
-	QUAD				fn_OffsetQuad;
-	LONG				fn_Mode;
+	ULONG				fn_Magic;		/* Magic number which helps to
+										 * identify this data structure
+										 * as being managed by smbfs.
+										 * We use this as a safety measure
+										 * in case smbfs receives a file
+										 * handle that it did not create.
+										 */
 
-	smba_file_t *		fn_File;
-	STRPTR				fn_FullName;
+	struct DosList *	fn_Volume;		/* Points back to the volume which
+										 * the file is associated with.
+										 */
+
+	struct FileHandle *	fn_Handle;		/* The AmigaDOS file handle which
+										 * this data structure is associated
+										 * with.
+										 */
+
+	QUAD				fn_OffsetQuad;	/* Current file read/write position,
+										 * as an unsigned 64 bit integer.
+										 */
+	LONG				fn_Mode;		/* File access mode, e.g. MODE_NEWFILE,
+										 * MODE_OLDFILE, MODE_READWRITE.
+										 */
+
+	smba_file_t *		fn_File;		/* The SMB file system interface to
+										 * the remote file.
+										 */
+	STRPTR				fn_FullName;	/* The name of the file at the time
+										 * it was opened. Note that this
+										 * includes the full path, using the
+										 * SMB path syntax.
+										 */
 };
 
 /****************************************************************************/
 
+/* The internal data structure which ties an AmigaDOS FileLock to the
+ * smbfs representation. smbfs creates this and returns a pointer to
+ * the ln_FileLock member.
+ */
 struct LockNode
 {
 	struct MinNode			ln_MinNode;
 
-	ULONG					ln_Magic;
+	#ifdef USE_SPLAY_TREE
+
+	struct splay_node		ln_SplayNameNode;
+	struct splay_node		ln_SplayAddressNode;
+
+	#endif /* USE_SPLAY_TREE */
+
+	ULONG					ln_Magic;	/* Magic number which helps to
+										 * identify this data structure
+										 * as being managed by smbfs.
+										 * We use this as a safety measure
+										 * in case smbfs receives a file
+										 * lock that it did not create.
+										 */
 
 	struct FileLock			ln_FileLock;
+										/* The AmigaDOS file lock which this
+										 * data structure is associated with.
+										 */
 
-	smba_file_t *			ln_File;
+	smba_file_t *			ln_File;	/* The SMB file system interface to
+										 * the remote file or directory.
+										 */
 	STRPTR					ln_FullName;
+										/* The name of the file or directory
+										 * at the time it was accessed. Note
+										 * that this includes the full path,
+										 * using the SMB path syntax.
+										 */
 
 	const struct MsgPort *	ln_LastUser;
+										/* This identifies the last Process
+										 * which used this file lock. We need
+										 * this to handle deleting from a
+										 * directory and scanning that directory
+										 * at the same time more smoothly.
+										 */
 
 	BOOL					ln_RestartExamine;
+										/* If this a file lock on a directory,
+										 * this flag states if directory
+										 * scanning in progress needs to
+										 * start over.
+										 */
 };
 
 /****************************************************************************/
@@ -136,6 +234,10 @@ struct LockNode
 
 /****************************************************************************/
 
+/* If possible, we want to use the memory pool functions in amiga.lib rather
+ * than those in ROM. The V37 build has to include these in the program itself
+ * since Kickstart 2.04 lacks them.
+ */
 #if (MINIMUM_OS_VERSION < 39)
 
 /* These are in amiga.lib */
@@ -161,19 +263,19 @@ static ULONG stack_usage_exit(const struct StackSwapStruct * stk);
 static LONG CVSPrintf(const TEXT * format_string, APTR args);
 static int LocalVSNPrintf(STRPTR buffer, int limit, const TEXT * formatString, APTR args);
 static void cleanup(void);
-static BOOL setup(const TEXT * program_name, const TEXT * service, const TEXT * workgroup, STRPTR username, STRPTR opt_password, BOOL opt_change_username_case, BOOL opt_change_password_case, const TEXT * opt_clientname, const TEXT * opt_servername, int opt_cachesize, int opt_max_transmit, int opt_timeout, LONG *opt_time_zone_offset, LONG *opt_dst_offset, BOOL opt_raw_smb, BOOL opt_unicode, BOOL opt_prefer_core_protocol, BOOL opt_session_setup_delay_unicode, BOOL opt_write_behind, const TEXT * device_name, const TEXT * volume_name, const TEXT * translation_file);
+static BOOL setup(const TEXT * program_name, const TEXT * service, const TEXT * workgroup, STRPTR username, STRPTR opt_password, BOOL opt_change_username_case, BOOL opt_change_password_case, const TEXT * opt_clientname, const TEXT * opt_servername, int opt_cachesize, int opt_max_transmit, int opt_timeout, LONG *opt_time_zone_offset, LONG *opt_dst_offset, BOOL opt_raw_smb, BOOL opt_unicode, BOOL opt_prefer_core_protocol, BOOL opt_session_setup_delay_unicode, BOOL opt_write_behind, int opt_smb_request_write_threshold, int opt_smb_request_read_threshold, BOOL scatter_gather, BOOL tcp_no_delay, int socket_receive_buffer_size, int socket_send_buffer_size, const TEXT * device_name, const TEXT * volume_name, BOOL add_volume, const TEXT * translation_file);
 static void file_system_handler(BOOL raise_priority, const TEXT * device_name, const TEXT * volume_name, const TEXT * service_name);
 
 /****************************************************************************/
 
-struct Library *			SysBase;
-struct Library *			DOSBase;
-struct Library *			UtilityBase;
-struct Library *			IntuitionBase;
-struct Library *			SocketBase;
-struct Library *			LocaleBase;
-struct Library *			TimerBase;
-struct Library *			IconBase;
+struct Library * SysBase;
+struct Library * DOSBase;
+struct Library * UtilityBase;
+struct Library * IntuitionBase;
+struct Library * SocketBase;
+struct Library * LocaleBase;
+struct Library * TimerBase;
+struct Library * IconBase;
 
 /****************************************************************************/
 
@@ -181,14 +283,14 @@ struct Library *			IconBase;
 
 /****************************************************************************/
 
-struct ExecIFace *			IExec;
-struct DOSIFace *			IDOS;
-struct UtilityIFace *		IUtility;
-struct IntuitionIFace *		IIntuition;
-struct SocketIFace *		ISocket;
-struct LocaleIFace *		ILocale;
-struct TimerIFace *			ITimer;
-struct IconIFace *			IIcon;
+struct ExecIFace *		IExec;
+struct DOSIFace *		IDOS;
+struct UtilityIFace *	IUtility;
+struct IntuitionIFace *	IIntuition;
+struct SocketIFace *	ISocket;
+struct LocaleIFace *	ILocale;
+struct TimerIFace *		ITimer;
+struct IconIFace *		IIcon;
 
 /****************************************************************************/
 
@@ -196,16 +298,16 @@ struct IconIFace *			IIcon;
 
 /****************************************************************************/
 
-struct timerequest			TimerRequest;
+struct timerequest TimerRequest;
 
 /****************************************************************************/
 
-struct Locale *				Locale;
+struct Locale * Locale;
 
 /****************************************************************************/
 
-int							errno;
-int							h_errno;
+int errno;
+int h_errno;
 
 /****************************************************************************/
 
@@ -232,6 +334,16 @@ static ULONG				WriteProtectKey;
 
 static struct MinList		FileList;
 static struct MinList		LockList;
+
+#ifdef USE_SPLAY_TREE
+
+static struct splay_tree	FileAddressTree;
+static struct splay_tree	FileNameTree;
+
+static struct splay_tree	LockAddressTree;
+static struct splay_tree	LockNameTree;
+
+#endif /* USE_SPLAY_TREE */
 
 static APTR					MemoryPool;
 static ULONG				total_memory_allocated;
@@ -282,7 +394,7 @@ extern int STDARGS swap_stack_and_call(struct StackSwapStruct * stk,APTR functio
 
 /****************************************************************************/
 
-LONG
+LONG SAVE_DS
 _start(STRPTR args, LONG args_length, struct ExecBase * exec_base)
 {
 	struct StackSwapStruct * stk = NULL;
@@ -401,7 +513,7 @@ _start(STRPTR args, LONG args_length, struct ExecBase * exec_base)
 			/* Allocate the new stack swapping data structure
 			 * and the stack space separately.
 			 */
-			stk = AllocVec(sizeof(*stk),MEMF_PUBLIC|MEMF_ANY);
+			stk = AllocMem(sizeof(*stk),MEMF_PUBLIC|MEMF_ANY);
 			if(stk == NULL)
 				goto out;
 
@@ -437,7 +549,7 @@ _start(STRPTR args, LONG args_length, struct ExecBase * exec_base)
  out:
 
 	if(stk != NULL)
-		FreeVec(stk);
+		FreeMem(stk, sizeof(*stk));
 
 	if(new_stack != NULL && new_stack_size > 0)
 		FreeMem(new_stack,new_stack_size);
@@ -561,10 +673,10 @@ stack_usage_exit(const struct StackSwapStruct * stk)
  * and fall back onto a default value if no keyword was provided,
  * or the keyword provided does not match what we have.
  */
-static BOOL
-get_switch_status(const TEXT * value,BOOL default_value)
+static LONG
+get_switch_status(const TEXT * value,LONG default_value)
 {
-	BOOL result = default_value;
+	LONG result = default_value;
 
 	if(value != NULL)
 	{
@@ -596,6 +708,26 @@ get_switch_status(const TEXT * value,BOOL default_value)
 
 /****************************************************************************/
 
+/* Shortcut for retrieving the value of an icon tool type, even if it
+ * has more than one name.
+ */
+static STRPTR
+get_icon_tool_type_value(TEXT * name,TEXT * alternative_name)
+{
+	STRPTR value = NULL;
+
+	if(Icon != NULL)
+	{
+		value = FindToolType(Icon->do_ToolTypes, name);
+		if(value == NULL && alternative_name != NULL)
+			value = FindToolType(Icon->do_ToolTypes, alternative_name);
+	}
+
+	return(value);
+}
+
+/****************************************************************************/
+
 /* This is the traditional main() program. */
 static LONG
 main(void)
@@ -617,6 +749,7 @@ main(void)
 		KEY		ServerName;
 		KEY		DeviceName;
 		KEY		VolumeName;
+		KEY		AddVolume;
 		NUMBER	MaxNameLen;
 		NUMBER	CacheSize;
 		SWITCH	DisableExAll;
@@ -627,6 +760,13 @@ main(void)
 		KEY		Protocol;
 		SWITCH	NetBIOSTransport;
 		SWITCH	WriteBehind;
+		NUMBER	WriteThreshold;
+		NUMBER	ReadThreshold;
+		KEY		ScatterGather;
+		SWITCH	TCPNoDelay;
+		KEY		TCPDelay;
+		NUMBER	SocketReceiveBuf;
+		NUMBER	SocketSendBuf;
 		KEY		SessionSetup;
 		KEY		Unicode;
 		SWITCH	CP437;
@@ -656,6 +796,7 @@ main(void)
 		"SERVER=SERVERNAME/K,"
 		"DEVICE=DEVICENAME/K,"
 		"VOLUME=VOLUMENAME/K,"
+		"ADDVOLUME/K,"
 		"MAXNAMELEN/N/K,"
 		"CACHE=CACHESIZE/N/K,"
 		"DISABLEEXALL/S,"
@@ -666,6 +807,13 @@ main(void)
 		"PROTOCOL/K,"
 		"NETBIOS/S,"
 		"WRITEBEHIND/S,"
+		"WRITETHRESHOLD/N/K,"
+		"READTHRESHOLD/N/K,"
+		"SCATTERGATHER/K,"
+		"TCP_NODELAY=TCPNODELAY/S,"
+		"TCPDELAY/K,"
+		"SO_RCVBUF=SOCKETRECEIVEBUFFER/N/K,"
+		"SO_SNDBUF=SOCKETSENDBUFFER/N/K,"
 		"SESSIONSETUP/K,"
 		"UNICODE/K,"
 		"CP437/S,"
@@ -682,48 +830,61 @@ main(void)
 	BOOL close_debug_file = FALSE;
 	TEXT program_name[MAX_FILENAME_LEN+1];
 	LONG result = RETURN_FAIL;
-	LONG number;
 	LONG tz_number, dst_number, debug_number;
 	LONG cache_size = 0;
 	LONG max_transmit = -1;
+	LONG smb_write_threshold = 0;
+	LONG smb_read_threshold = 0;
 	LONG timeout = 0;
-	char env_protocol[8];
-	char env_workgroup_name[17];
-	char env_user_name[64];
-	char env_password[64];
+	LONG socket_receive_buffer = 0;
+	LONG socket_send_buffer = 0;
+	TEXT env_protocol[8];
+	TEXT env_workgroup_name[17];
+	TEXT env_user_name[64];
+	TEXT env_password[64];
 
 	/* Don't emit any debugging output before we are ready. */
 	SETDEBUGLEVEL(0);
 
 	/* This needs to be set up properly for report_error()
-	 * to work.
+	 * to work. The cleanup() function will eventually
+	 * call it.
 	 */
 	NewList((struct List *)&ErrorList);
 
+	/* The command parameters will be filled in either from
+	 * icon tool types or from the CLI command line arguments.
+	 */
 	memset(&args,0,sizeof(args));
 
-	/* If this program was launched from Workbench,
-	 * parameter passing will have to be handled
-	 * differently.
+	/* If this program was launched from Workbench, the
+	 * command parameters will have to be from the icon
+	 * tool types.
 	 */
 	if(WBStartup != NULL)
 	{
+		TEXT * icon_file_name;
+		BPTR icon_file_lock;
 		STRPTR str;
 		BPTR old_dir;
-		LONG n;
-
-		if(WBStartup->sm_NumArgs > 1)
-			n = 1;
-		else
-			n = 0;
+		int size;
+		int n;
 
 		/* Get the name of the program, as it was launched
 		 * from Workbench. We actually prefer the name of
 		 * the first project file, if there is one.
 		 */
-		strlcpy(program_name,WBStartup->sm_ArgList[n].wa_Name,sizeof(program_name));
+		if(WBStartup->sm_NumArgs > 1)
+			n = 1;
+		else
+			n = 0;
 
-		SETPROGRAMNAME(FilePart(program_name));
+		icon_file_name = WBStartup->sm_ArgList[n].wa_Name;
+		icon_file_lock = WBStartup->sm_ArgList[n].wa_Lock;
+
+		strlcpy(program_name,FilePart(icon_file_name),sizeof(program_name));
+
+		SETPROGRAMNAME(program_name);
 
 		/* Now open icon.library and read that icon. */
 		IconBase = OpenLibrary("icon.library",0);
@@ -748,50 +909,43 @@ main(void)
 			goto out;
 		}
 
-		old_dir = CurrentDir(WBStartup->sm_ArgList[n].wa_Lock);
-		Icon = GetDiskObject(WBStartup->sm_ArgList[n].wa_Name);
+		old_dir = CurrentDir(icon_file_lock);
+		Icon = GetDiskObject(icon_file_name);
 		CurrentDir(old_dir);
 
 		if(Icon == NULL)
 		{
-			report_error("Icon not found.");
+			report_error("Icon file for '%s' not found.", icon_file_name);
 			goto out;
 		}
 
 		/* Only input validation errors are reported below. */
 		result = RETURN_ERROR;
 
-		/* Examine the icon's tool types and use the
-		 * information to fill the startup parameter
-		 * data structure.
+		/* Get the debug options ready before we will deal
+		 * with the remaining parameters.
 		 */
-		str = FindToolType(Icon->do_ToolTypes,"DEBUG");
-		if(str == NULL)
-			str = FindToolType(Icon->do_ToolTypes,"DEBUGLEVEL");
-
-		if(str != NULL)
-		{
-			if(StrToLong(str,&debug_number) == -1)
-			{
-				report_error("Invalid number '%s' for 'DEBUG' parameter.",str);
-				goto out;
-			}
-
-			args.DebugLevel = &debug_number;
-		}
-
-		str = FindToolType(Icon->do_ToolTypes,"DEBUGFILE");
-		if(str != NULL)
-			args.DebugFile = str;
-
-		/* Configure the debugging options. */
-		if(args.DebugLevel != NULL)
-			SETDEBUGLEVEL(*args.DebugLevel);
-		else
-			SETDEBUGLEVEL(0);
-
 		#if DEBUG
 		{
+			str = get_icon_tool_type_value("DEBUG","DEBUGLEVEL");
+			if(str != NULL)
+			{
+				if(StrToLong(str,&debug_number) == -1 || debug_number < 0)
+				{
+					report_error("Invalid number '%s' for 'DEBUG' parameter.",str);
+					goto out;
+				}
+
+				args.DebugLevel = &debug_number;
+			}
+
+			/* Configure the debugging options. */
+			if(args.DebugLevel != NULL)
+				SETDEBUGLEVEL(*args.DebugLevel);
+			else
+				SETDEBUGLEVEL(0);
+
+			args.DebugFile = get_icon_tool_type_value("DEBUGFILE",NULL);
 			if(args.DebugFile != NULL)
 			{
 				/* Try to append the output to an existing file
@@ -810,7 +964,7 @@ main(void)
 					 * line feeds to it, so that any new output
 					 * will be separated from the old contents.
 					 */
-					if(ExamineFH(debug_file, fib) && fib->fib_Size)
+					if(ExamineFH(debug_file, fib) && fib->fib_Size > 0)
 						FPrintf(debug_file,"\n\n");
 
 					SETDEBUGFILE(debug_file);
@@ -819,107 +973,107 @@ main(void)
 				}
 			}
 		}
+		#else
+		{
+			if(get_icon_tool_type_value("DEBUG","DEBUGLEVEL") != NULL || get_icon_tool_type_value("DEBUGFILE",NULL) != NULL)
+			{
+				report_error("This version of the smbfs program has no built-in debug support.");
+				goto out;
+			}
+		}
 		#endif /* DEBUG */
 
-		str = FindToolType(Icon->do_ToolTypes,"DOMAIN");
-		if(str == NULL)
-			str = FindToolType(Icon->do_ToolTypes,"WORKGROUP");
+		/* Examine the icon's tool types and use the
+		 * information to fill the startup parameter
+		 * data structure.
+		 */
+		args.Service = get_icon_tool_type_value("SERVICE", "SHARE");
+		if(args.Service == NULL)
+		{
+			report_error("'SERVICE' parameter needs an argument.");
+			goto out;
+		}
 
-		args.Workgroup = str;
+		/* Set up the name of the program, as it will be
+		 * displayed in error requesters.
+		 */
+		size = strlen(icon_file_name) + strlen(" ''") + strlen(args.Service)+1;
 
-		str = FindToolType(Icon->do_ToolTypes,"USER");
-		if(str == NULL)
-			str = FindToolType(Icon->do_ToolTypes,"USERNAME");
+		NewProgramName = AllocVec(size,MEMF_ANY|MEMF_PUBLIC);
+		if(NewProgramName != NULL)
+			LocalSNPrintf(NewProgramName,size,"%s '%s'",icon_file_name,args.Service);
 
-		args.UserName = str;
+		args.Workgroup = get_icon_tool_type_value("DOMAIN","WORKGROUP");
+		args.UserName = get_icon_tool_type_value("USER","USERNAME");
 
-		str = FindToolType(Icon->do_ToolTypes,"CHANGEUSERNAMECASE");
+		str = get_icon_tool_type_value("CHANGEUSERNAMECASE", NULL);
 		args.ChangeUserNameCase = (str != NULL) ? str : (STRPTR)"yes";
 
-		args.Password = FindToolType(Icon->do_ToolTypes,"PASSWORD");
+		args.Password = get_icon_tool_type_value("PASSWORD", NULL);
 
-		args.ChangePasswordCase = FindToolType(Icon->do_ToolTypes,"CHANGEPASSWORDCASE");
-		if(args.ChangePasswordCase == NULL && FindToolType(Icon->do_ToolTypes,"CHANGECASE") != NULL)
+		args.ChangePasswordCase = get_icon_tool_type_value("CHANGEPASSWORDCASE", NULL);
+		if(args.ChangePasswordCase == NULL && get_icon_tool_type_value("CHANGECASE", NULL) != NULL)
 			args.ChangePasswordCase = "yes";
 
-		if(FindToolType(Icon->do_ToolTypes,"DISABLEEXALL") != NULL)
-			args.DisableExAll = TRUE;
+		args.TCPDelay = get_icon_tool_type_value("TCPDELAY", NULL);
+		if(args.TCPDelay == NULL && get_icon_tool_type_value("TCPNODELAY", "TCP_NODELAY") != NULL)
+			args.TCPDelay = "no";
 
-		if(FindToolType(Icon->do_ToolTypes,"OMITHIDDEN") != NULL)
-			args.OmitHidden = TRUE;
+		args.DisableExAll = get_icon_tool_type_value("DISABLEEXALL", NULL) != NULL;
+		args.OmitHidden = get_icon_tool_type_value("OMITHIDDEN", NULL) != NULL;
+		args.Quiet = get_icon_tool_type_value("QUIET", NULL) != NULL;
+		args.RaisePriority = get_icon_tool_type_value("RAISEPRIORITY", NULL) != NULL;
+		args.CaseSensitive = get_icon_tool_type_value("CASE", "CASESENSITIVE") != NULL;
+		args.NetBIOSTransport = get_icon_tool_type_value("NETBIOS", NULL) != NULL;
+		args.WriteBehind = get_icon_tool_type_value("WRITEBEHIND", NULL) != NULL;
 
-		if(FindToolType(Icon->do_ToolTypes,"QUIET") != NULL)
-			args.Quiet = TRUE;
+		args.ClientName = get_icon_tool_type_value("CLIENT", "CLIENTNAME");
+		args.ServerName = get_icon_tool_type_value("SERVER", "SERVERNAME");
+		args.DeviceName = get_icon_tool_type_value("DEVICE", "DEVICENAME");
+		args.VolumeName = get_icon_tool_type_value("VOLUME", "VOLUMENAME");
 
-		if(FindToolType(Icon->do_ToolTypes,"RAISEPRIORITY") != NULL)
-			args.RaisePriority = TRUE;
+		if(args.VolumeName == NULL)
+			args.AddVolume = get_icon_tool_type_value("ADDVOLUME", NULL);
 
-		if(FindToolType(Icon->do_ToolTypes,"CASE") != NULL ||
-		   FindToolType(Icon->do_ToolTypes,"CASESENSITIVE") != NULL)
-		{
-			args.CaseSensitive = TRUE;
-		}
-
-		str = FindToolType(Icon->do_ToolTypes,"CLIENT");
-		if(str == NULL)
-			str = FindToolType(Icon->do_ToolTypes,"CLIENTNAME");
-
-		args.ClientName = str;
-
-		str = FindToolType(Icon->do_ToolTypes,"SERVER");
-		if(str == NULL)
-			str = FindToolType(Icon->do_ToolTypes,"SERVERNAME");
-
-		args.ServerName = str;
-
-		str = FindToolType(Icon->do_ToolTypes,"DEVICE");
-		if(str == NULL)
-			str = FindToolType(Icon->do_ToolTypes,"DEVICENAME");
-
-		args.DeviceName = str;
-
-		str = FindToolType(Icon->do_ToolTypes,"VOLUME");
-		if(str == NULL)
-			str = FindToolType(Icon->do_ToolTypes,"VOLUMENAME");
-
-		args.VolumeName = str;
-
-		str = FindToolType(Icon->do_ToolTypes,"SERVICE");
-		if(str == NULL)
-			str = FindToolType(Icon->do_ToolTypes,"SHARE");
-
-		args.Service = str;
-
+		str = get_icon_tool_type_value("MAXNAMELEN", NULL);
 		if(str != NULL)
 		{
-			int size;
-
-			/* Set up the name of the program, as it will be
-			 * displayed in error requesters.
-			 */
-			size = strlen(WBStartup->sm_ArgList[0].wa_Name) + strlen(" ''") + strlen(str)+1;
-
-			NewProgramName = AllocVec(size,MEMF_ANY|MEMF_PUBLIC);
-			if(NewProgramName != NULL)
-				LocalSNPrintf(NewProgramName,size,"%s '%s'",WBStartup->sm_ArgList[0].wa_Name,str);
-		}
-
-		str = FindToolType(Icon->do_ToolTypes,"MAXNAMELEN");
-		if(str != NULL)
-		{
-			if(StrToLong(str,&number) == -1)
+			if(StrToLong(str,&MaxNameLen) == -1)
 			{
 				report_error("Invalid number '%s' for 'MAXNAMELEN' parameter.",str);
 				goto out;
 			}
 
-			MaxNameLen = number;
+			args.MaxNameLen = &MaxNameLen;
 		}
 
-		str = FindToolType(Icon->do_ToolTypes,"TZ");
-		if(str == NULL)
-			str = FindToolType(Icon->do_ToolTypes,"TIMEZONEOFFSET");
+		str = get_icon_tool_type_value("WRITETHRESHOLD", NULL);
+		if(str != NULL)
+		{
+			if(StrToLong(str,&smb_write_threshold) == -1)
+			{
+				report_error("Invalid number '%s' for 'WRITETHRESHOLD' parameter.",str);
+				goto out;
+			}
 
+			args.WriteThreshold = &smb_write_threshold;
+		}
+
+		str = get_icon_tool_type_value("READTHRESHOLD", NULL);
+		if(str != NULL)
+		{
+			if(StrToLong(str,&smb_read_threshold) == -1)
+			{
+				report_error("Invalid number '%s' for 'READTHRESHOLD' parameter.",str);
+				goto out;
+			}
+
+			args.ReadThreshold = &smb_read_threshold;
+		}
+
+		args.ScatterGather = get_icon_tool_type_value("SCATTERGATHER", NULL);
+
+		str = get_icon_tool_type_value("TZ","TIMEZONEOFFSET");
 		if(str != NULL)
 		{
 			if(StrToLong(str,&tz_number) == -1)
@@ -931,10 +1085,7 @@ main(void)
 			args.TimeZoneOffset = &tz_number;
 		}
 
-		str = FindToolType(Icon->do_ToolTypes,"DST");
-		if(str == NULL)
-			str = FindToolType(Icon->do_ToolTypes,"DSTOFFSET");
-
+		str = get_icon_tool_type_value("DST", "DSTOFFSET");
 		if(str != NULL)
 		{
 			if(StrToLong(str,&dst_number) == -1)
@@ -946,82 +1097,79 @@ main(void)
 			args.DSTOffset = &dst_number;
 		}
 
-		args.Protocol = FindToolType(Icon->do_ToolTypes,"PROTOCOL");
+		args.Protocol = get_icon_tool_type_value("PROTOCOL", NULL);
+		args.SessionSetup = get_icon_tool_type_value("SESSIONSETUP", NULL);
 
-		if(FindToolType(Icon->do_ToolTypes,"NETBIOS") != NULL)
-			args.NetBIOSTransport = TRUE;
+		args.TranslationFile = get_icon_tool_type_value("TRANSLATE", "TRANSLATIONFILE");
+		args.Unicode = get_icon_tool_type_value("UNICODE", NULL);
+		args.CP437 = get_icon_tool_type_value("CP437", NULL) != NULL;
+		args.CP850 = get_icon_tool_type_value("CP850", NULL) != NULL;
 
-		if(FindToolType(Icon->do_ToolTypes,"WRITEBEHIND") != NULL)
-			args.WriteBehind = TRUE;
-
-		args.SessionSetup = FindToolType(Icon->do_ToolTypes,"SESSIONSETUP");
-
-		str = FindToolType(Icon->do_ToolTypes,"TRANSLATE");
-		if(str == NULL)
-			str = FindToolType(Icon->do_ToolTypes,"TRANSLATIONFILE");
-
+		str = get_icon_tool_type_value("CACHE","CACHESIZE");
 		if(str != NULL)
 		{
-			args.TranslationFile = str;
-		}
-		else
-		{
-			str = FindToolType(Icon->do_ToolTypes,"UNICODE");
-			if (str != NULL)
-				args.Unicode = str;
-			else if (FindToolType(Icon->do_ToolTypes,"CP437") != NULL)
-				args.CP437 = TRUE;
-			else if (FindToolType(Icon->do_ToolTypes,"CP850") != NULL)
-				args.CP850 = TRUE;
-		}
-
-		str = FindToolType(Icon->do_ToolTypes,"CACHE");
-		if(str == NULL)
-			str = FindToolType(Icon->do_ToolTypes,"CACHESIZE");
-
-		if(str != NULL)
-		{
-			if(StrToLong(str,&number) == -1)
+			if(StrToLong(str,&cache_size) == -1)
 			{
 				report_error("Invalid number '%s' for 'CACHE' parameter.",str);
 				goto out;
 			}
 
-			cache_size = number;
+			args.CacheSize = &cache_size;
 		}
 
-		str = FindToolType(Icon->do_ToolTypes,"MAXTRANSMIT");
+		str = get_icon_tool_type_value("MAXTRANSMIT", NULL);
 		if(str != NULL)
 		{
-			if(StrToLong(str,&number) == -1)
+			if(StrToLong(str,&max_transmit) == -1)
 			{
 				report_error("Invalid number '%s' for 'MAXTRANSMIT' parameter.",str);
 				goto out;
 			}
 
-			max_transmit = number;
+			args.MaxTransmit = &max_transmit;
 		}
 
-		str = FindToolType(Icon->do_ToolTypes,"TIMEOUT");
+		str = get_icon_tool_type_value("TIMEOUT", NULL);
 		if(str != NULL)
 		{
-			if(StrToLong(str,&number) == -1 || number < 0)
+			if(StrToLong(str,&timeout) == -1)
 			{
 				report_error("Invalid number '%s' for 'TIMEOUT' parameter.",str);
 				goto out;
 			}
 
-			timeout = number;
+			args.Timeout = &timeout;
 		}
 
-		if(args.Service == NULL)
+		str = get_icon_tool_type_value("SOCKETRECEIVEBUFFER", "SO_RCVBUF");
+		if(str != NULL)
 		{
-			report_error("'SERVICE' parameter needs an argument.");
-			goto out;
+			if(StrToLong(str,&socket_receive_buffer) == -1)
+			{
+				report_error("Invalid number '%s' for 'SOCKETRECEIVEBUFFER' parameter.",str);
+				goto out;
+			}
+
+			args.SocketReceiveBuf = &socket_receive_buffer;
+		}
+
+		str = get_icon_tool_type_value("SOCKETSENDBUFFER", "SO_SENDBUF");
+		if(str != NULL)
+		{
+			if(StrToLong(str,&socket_send_buffer) == -1)
+			{
+				report_error("Invalid number '%s' for 'SOCKETSENDBUFFER' parameter.",str);
+				goto out;
+			}
+
+			args.SocketSendBuf = &socket_send_buffer;
 		}
 	}
 	else
 	{
+		const TEXT * name;
+		int size;
+
 		/* Only input validation errors are reported below. */
 		result = RETURN_ERROR;
 
@@ -1036,14 +1184,14 @@ main(void)
 			goto out;
 		}
 
-		/* Configure the debugging options. */
-		if(args.DebugLevel != NULL)
-			SETDEBUGLEVEL(*args.DebugLevel);
-		else
-			SETDEBUGLEVEL(0);
-
 		#if DEBUG
 		{
+			/* Configure the debugging options. */
+			if(args.DebugLevel != NULL)
+				SETDEBUGLEVEL(*args.DebugLevel);
+			else
+				SETDEBUGLEVEL(0);
+
 			if(args.DebugFile != NULL)
 			{
 				/* Try to append the output to an existing file
@@ -1062,7 +1210,7 @@ main(void)
 					 * line feeds to it, so that any new output
 					 * will be separated from the old contents.
 					 */
-					if(ExamineFH(debug_file, fib) && fib->fib_Size)
+					if(ExamineFH(debug_file, fib) && fib->fib_Size > 0)
 						FPrintf(debug_file,"\n\n");
 				}
 			}
@@ -1073,36 +1221,30 @@ main(void)
 
 			SETDEBUGFILE(debug_file);
 		}
+		#else
+		{
+			if(args.DebugLevel != NULL || args.DebugFile != NULL)
+			{
+				report_error("This version of the smbfs program has no built-in debug support.");
+				goto out;
+			}
+		}
 		#endif /* DEBUG */
 
 		D(("%s (%s)", VERS, DATE));
 
-		if(args.Service != NULL)
-		{
-			const TEXT * name = FilePart(program_name);
-			int size;
+		ASSERT( args.Service != NULL );
 
-			/* Set up the name of the program, as it will be
-			 * displayed in the proces status list.
-			 */
-			size = strlen(name) + strlen(" ''") + strlen(args.Service)+1;
+		/* Set up the name of the program, as it will be
+		 * displayed in the proces status list.
+		 */
+		name = FilePart(program_name);
 
-			NewProgramName = AllocVec(size,MEMF_ANY|MEMF_PUBLIC);
-			if(NewProgramName != NULL)
-				LocalSNPrintf(NewProgramName,size,"%s '%s'",name,args.Service);
-		}
+		size = strlen(name) + strlen(" ''") + strlen(args.Service)+1;
 
-		if(args.MaxNameLen != NULL)
-			MaxNameLen = (*args.MaxNameLen);
-
-		if(args.CacheSize != NULL)
-			cache_size = (*args.CacheSize);
-
-		if(args.MaxTransmit != NULL)
-			max_transmit = (*args.MaxTransmit);
-
-		if(args.Timeout != NULL && (*args.Timeout) >= 0)
-			timeout = (*args.Timeout);
+		NewProgramName = AllocVec(size,MEMF_ANY|MEMF_PUBLIC);
+		if(NewProgramName != NULL)
+			LocalSNPrintf(NewProgramName,size,"%s '%s'",name,args.Service);
 	}
 
 	/* If no workgroup/domain was given, try the environment variables. */
@@ -1191,6 +1333,10 @@ main(void)
 	if(args.ChangePasswordCase == NULL && args.ChangeCase)
 		args.ChangePasswordCase = "yes";
 
+	/* Disable the TCP delay? */
+	if(args.TCPDelay == NULL && args.TCPNoDelay)
+		args.TCPDelay = "no";
+
 	/* Use the default if no device or volume name is given. */
 	if(args.DeviceName == NULL && args.VolumeName == NULL)
 	{
@@ -1198,6 +1344,9 @@ main(void)
 
 		D(("no device/volume name given, using 'devicename=%s' instead.", args.DeviceName));
 	}
+
+	if(args.VolumeName != NULL)
+		args.AddVolume = "yes";
 
 	/* Restrict the command set which smbfs uses? */
 	if(args.Protocol == NULL)
@@ -1234,29 +1383,45 @@ main(void)
 		D(("using 'unicode=%s'.", args.Unicode));
 	}
 
-	if(Stricmp(args.Unicode,"OFF") != SAME && Stricmp(args.Unicode,"ON") != SAME)
+	/* Is the Unicode parameter even valid? */
+	if(get_switch_status(args.Unicode,-1) == -1)
 	{
 		report_error("'UNICODE' parameter must be either 'ON' or 'OFF'.");
 		goto out;
 	}
 
 	/* Code page based translation using a file disables
-	 * the built-in CP437 and CP850 translation.
+	 * Unicode support and the built-in CP437 and CP850
+	 * translation.
 	 */
-	if(args.TranslationFile != NULL)
+	if (args.TranslationFile != NULL)
+	{
 		args.CP437 = args.CP850 = FALSE;
-	else if (args.CP437)
-		args.CP850 = FALSE;
-	else if (args.CP850)
-		args.CP437 = FALSE;
+		args.Unicode = "off";
+	}
+	/* Unicode support disables the code-page based
+	 * translation.
+	 */
+	else if (get_switch_status(args.Unicode, FALSE))
+	{
+		args.CP437 = args.CP850 = FALSE;
+	}
+	else
+	{
+		if(args.CP437 && args.CP850)
+		{
+			report_error("You can use either the 'CP437' or the 'CP850' parameters, but not both.");
+			goto out;
+		}
+	}
 
 	/* Use one of the built-in code page translation tables? */
 	if (args.CP437)
 	{
 		SHOWMSG("using code page 437 translation");
 
-		memmove(map_amiga_to_smb_name,unicode_to_cp437,sizeof(unicode_to_cp437));
-		memmove(map_smb_to_amiga_name,cp437_to_unicode,sizeof(cp437_to_unicode));
+		memcpy(map_amiga_to_smb_name,unicode_to_cp437,sizeof(unicode_to_cp437));
+		memcpy(map_smb_to_amiga_name,cp437_to_unicode,sizeof(cp437_to_unicode));
 
 		TranslateNames = TRUE;
 	}
@@ -1264,11 +1429,75 @@ main(void)
 	{
 		SHOWMSG("using code page 850 translation");
 
-		memmove(map_amiga_to_smb_name,unicode_to_cp850,sizeof(unicode_to_cp850));
-		memmove(map_smb_to_amiga_name,cp850_to_unicode,sizeof(cp850_to_unicode));
+		memcpy(map_amiga_to_smb_name,unicode_to_cp850,sizeof(unicode_to_cp850));
+		memcpy(map_smb_to_amiga_name,cp850_to_unicode,sizeof(cp850_to_unicode));
 
 		TranslateNames = TRUE;
 	}
+
+	if(args.MaxNameLen != NULL)
+	{
+		MaxNameLen = (*args.MaxNameLen);
+		if(MaxNameLen <= 0)
+		{
+			report_error("'MAXNAMELEN' parameter must be > 0.");
+			goto out;
+		}
+	}
+
+	if(args.CacheSize != NULL)
+	{
+		cache_size = (*args.CacheSize);
+		if(cache_size <= 0)
+		{
+			report_error("'CACHESIZE' parameter must be > 0.");
+			goto out;
+		}
+	}
+
+	if(args.MaxTransmit != NULL)
+	{
+		max_transmit = (*args.MaxTransmit);
+		if(max_transmit <= 0)
+		{
+			report_error("'MAXTRANSMIT' parameter must be > 0.");
+			goto out;
+		}
+	}
+
+	if(args.Timeout != NULL)
+	{
+		timeout = (*args.Timeout);
+		if(timeout <= 0)
+		{
+			report_error("'TIMEOUT' parameter must be > 0.");
+			goto out;
+		}
+	}
+
+	if(args.WriteThreshold == NULL)
+		args.WriteThreshold = &smb_write_threshold;
+
+	D(("write threshold = %ld", (*args.WriteThreshold)));
+
+	if(args.ReadThreshold == NULL)
+		args.ReadThreshold = &smb_read_threshold;
+
+	D(("read threshold = %ld", (*args.ReadThreshold)));
+
+	D(("scatter gather = %s", get_switch_status(args.ScatterGather, FALSE) ? "enabled" : "disabled"));
+
+	D(("tcp delay = %s", get_switch_status(args.TCPDelay, FALSE) ? "enabled" : "disabled"));
+
+	if(args.SocketReceiveBuf == NULL)
+		args.SocketReceiveBuf = &socket_receive_buffer;
+
+	D(("socket receive buffer size = %ld", (*args.SocketReceiveBuf)));
+
+	if(args.SocketSendBuf == NULL)
+		args.SocketSendBuf = &socket_send_buffer;
+
+	D(("socket send buffer size = %ld", (*args.SocketSendBuf)));
 
 	DisableExAll = (BOOL)(args.DisableExAll != 0);
 	CaseSensitive = (BOOL)(args.CaseSensitive != 0);
@@ -1345,6 +1574,8 @@ main(void)
 	else
 		D(("volume name = NULL."));
 
+	D(("add volume = %s", args.AddVolume));
+
 	if(args.TranslationFile != NULL)
 		D(("translation file = '%s'.", args.TranslationFile));
 	else
@@ -1379,8 +1610,15 @@ main(void)
 		Stricmp(args.Protocol,"CORE") == SAME,
 		Stricmp(args.SessionSetup,"DELAY") == SAME,
 		args.WriteBehind,
+		(*args.WriteThreshold),
+		(*args.ReadThreshold),
+		get_switch_status(args.ScatterGather, FALSE),
+		get_switch_status(args.TCPDelay, FALSE),
+		(*args.SocketReceiveBuf),
+		(*args.SocketSendBuf),
 		args.DeviceName,
 		args.VolumeName,
+		get_switch_status(args.AddVolume, TRUE),
 		args.TranslationFile))
 	{
 		char setenv_name[40];
@@ -1470,11 +1708,11 @@ main(void)
 
 	if(close_debug_file && debug_file != ZERO)
 	{
-		Close(debug_file);
-
 		SETDEBUGFILE(ZERO);
 
 		SETDEBUGLEVEL(0);
+
+		Close(debug_file);
 	}
 
 	return(result);
@@ -1482,6 +1720,12 @@ main(void)
 
 /****************************************************************************/
 
+/* Our own FPrintf(), which is needed because this code has to build
+ * both for AmigaOS 2.x/3.x and 4.x, and with Lattice/SAS/GCC and the
+ * header files make it difficult to do this. The FPrintf() declaration
+ * is not always usable, depending upon which AmigaOS header file set
+ * you are using.
+ */
 static LONG VARARGS68K
 LocalFPrintf(BPTR output, const TEXT * format, ...)
 {
@@ -1631,124 +1875,130 @@ string_toupper(STRPTR s)
 
 /* Prepare the accumulated list of error messages for display
  * and purge the contents of that list.
+ *
+ * Unless the program was started from Workbench this function
+ * will do nothing.
  */
 static void
 display_error_message_list(void)
 {
-	struct MinNode * last = NULL;
-	struct MinNode * mn;
-	TEXT * message = NULL;
-	const TEXT * str;
-	int size;
-
-	/* Determine how much memory will have to be
-	 * allocated to hold all the accumulated
-	 * error messages.
-	 */
-	size = 0;
-
-	for(mn = ErrorList.mlh_Head ;
-	    mn->mln_Succ != NULL ;
-	    mn = mn->mln_Succ)
+	if(WBStartup != NULL)
 	{
-		last = mn;
+		struct MinNode * last = NULL;
+		struct MinNode * mn;
+		TEXT * message = NULL;
+		const TEXT * str;
+		int size;
 
-		str = (TEXT *)(mn + 1);
+		/* Determine how much memory will have to be
+		 * allocated to hold all the accumulated
+		 * error messages.
+		 */
+		size = 0;
 
-		size += strlen(str)+1;
-	}
+		for(mn = ErrorList.mlh_Head ;
+		    mn->mln_Succ != NULL ;
+		    mn = mn->mln_Succ)
+		{
+			last = mn;
 
-	/* Allocate the memory for the messages, then
-	 * copy them there.
-	 */
-	if(size > 0)
-	{
-		message = AllocVec(size,MEMF_ANY);
+			str = (TEXT *)(mn + 1);
+
+			size += strlen(str)+1;
+		}
+
+		/* Allocate the memory for the messages, then
+		 * copy them there.
+		 */
+		if(size > 0)
+		{
+			message = AllocVec(size,MEMF_ANY);
+			if(message != NULL)
+			{
+				int message_len;
+				int len;
+
+				message_len = 0;
+
+				for(mn = ErrorList.mlh_Head ;
+				    mn->mln_Succ != NULL ;
+				    mn = mn->mln_Succ)
+				{
+					str = (TEXT *)(mn + 1);
+					len = strlen(str);
+
+					memcpy(&message[message_len], str, len);
+					message_len += len;
+
+					if(mn != last)
+						message[message_len++] = '\n';
+				}
+
+				ASSERT( message_len < size );
+
+				message[message_len] = '\0';
+			}
+		}
+
+		/* Purge the list. */
+		while((mn = (struct MinNode *)RemHead((struct List *)&ErrorList)) != NULL)
+			FreeVec(mn);
+
+		/* Display the error messages. */
 		if(message != NULL)
 		{
-			int message_len;
-			int len;
+			IntuitionBase = OpenLibrary("intuition.library",37);
 
-			message_len = 0;
-
-			for(mn = ErrorList.mlh_Head ;
-			    mn->mln_Succ != NULL ;
-			    mn = mn->mln_Succ)
+			#if defined(__amigaos4__)
 			{
-				str = (TEXT *)(mn + 1);
-				len = strlen(str);
+				if(IntuitionBase != NULL)
+				{
+					IIntuition = (struct IntuitionIFace *)GetInterface(IntuitionBase, "main", 1, 0);
+					if(IIntuition == NULL)
+					{
+						CloseLibrary(IntuitionBase);
+						IntuitionBase = NULL;
+					}
+				}
+			}
+			#endif /* __amigaos4__ */
 
-				memcpy(&message[message_len], str, len);
-				message_len += len;
+			if(IntuitionBase != NULL)
+			{
+				struct EasyStruct es;
+				STRPTR title;
 
-				if(mn != last)
-					message[message_len++] = '\n';
+				memset(&es,0,sizeof(es));
+
+				if(NewProgramName != NULL)
+					title = NewProgramName;
+				else
+					title = WBStartup->sm_ArgList[0].wa_Name;
+
+				es.es_StructSize	= sizeof(es);
+				es.es_Title			= title;
+				es.es_TextFormat	= message;
+				es.es_GadgetFormat	= "OK";
+
+				EasyRequestArgs(NULL,&es,NULL,NULL);
 			}
 
-			ASSERT( message_len < size );
-
-			message[message_len] = '\0';
+			FreeVec(message);
 		}
-	}
-
-	/* Purge the list. */
-	while((mn = (struct MinNode *)RemHead((struct List *)&ErrorList)) != NULL)
-		FreeVec(mn);
-
-	/* Display the error messages. */
-	if(message != NULL)
-	{
-		IntuitionBase = OpenLibrary("intuition.library",37);
 
 		#if defined(__amigaos4__)
 		{
-			if(IntuitionBase != NULL)
+			if(IIntuition != NULL)
 			{
-				IIntuition = (struct IntuitionIFace *)GetInterface(IntuitionBase, "main", 1, 0);
-				if(IIntuition == NULL)
-				{
-					CloseLibrary(IntuitionBase);
-					IntuitionBase = NULL;
-				}
+				DropInterface((struct Interface *)IIntuition);
+				IIntuition = NULL;
 			}
 		}
 		#endif /* __amigaos4__ */
 
-		if(IntuitionBase != NULL)
-		{
-			struct EasyStruct es;
-			STRPTR title;
-
-			memset(&es,0,sizeof(es));
-
-			if(NewProgramName == NULL)
-				title = WBStartup->sm_ArgList[0].wa_Name;
-			else
-				title = NewProgramName;
-
-			es.es_StructSize	= sizeof(es);
-			es.es_Title			= title;
-			es.es_TextFormat	= message;
-			es.es_GadgetFormat	= "OK";
-
-			EasyRequestArgs(NULL,&es,NULL,NULL);
-		}
-
-		FreeVec(message);
+		CloseLibrary(IntuitionBase);
+		IntuitionBase = NULL;
 	}
-
-	#if defined(__amigaos4__)
-	{
-		if(IIntuition != NULL)
-		{
-			DropInterface((struct Interface *)IIntuition);
-			IIntuition = NULL;
-		}
-	}
-	#endif /* __amigaos4__ */
-
-	CloseLibrary(IntuitionBase);
-	IntuitionBase = NULL;
 }
 
 /* Add another error message to the list; the messages are
@@ -1789,6 +2039,10 @@ report_error(const TEXT * fmt,...)
 	{
 		va_list args;
 
+		/* If this program was started from Workbench the
+		 * error messages will be collected for later
+		 * display.
+		 */
 		if(WBStartup != NULL)
 		{
 			#if defined(__amigaos4__)
@@ -2076,22 +2330,29 @@ tm_to_seconds(const struct tm * const tm)
 
 /****************************************************************************/
 
+/* This is used by the CVSPrintf() and LocalSNPrintf() functions below. */
 struct FormatContext
 {
-	TEXT *	fc_Buffer;
-	int		fc_Limit;
-	int		fc_Size;
+	TEXT *	fc_Buffer;	/* Where to store the next character. */
+	int		fc_Limit;	/* How many more characters may be stored. */
+	int		fc_Size;	/* How many characters were stored so far. */
 };
 
 /****************************************************************************/
 
+/* We just count the number of characters here. Note that this function
+ * has two parameters and uses only one: this is needed for OS4 for which
+ * RawDoFmt() always passes both.
+ */
 static void ASM
-CountChar(REG(a3,struct FormatContext * fc))
+CountChar(REG(d0,TEXT unused_c),REG(a3,struct FormatContext * fc))
 {
 	fc->fc_Size++;
 }
 
-/* Count the number of characters LocalSNPrintf() would put into a string. */
+/* Count the number of characters LocalSNPrintf() would put into a string.
+ * Note that this includes the terminating NUL character.
+ */
 static LONG
 CVSPrintf(const TEXT * format_string,APTR args)
 {
@@ -2106,6 +2367,7 @@ CVSPrintf(const TEXT * format_string,APTR args)
 
 /****************************************************************************/
 
+/* Store the next character in the buffer, but only if there is still room. */
 static void ASM
 StuffChar(REG(d0,TEXT c),REG(a3,struct FormatContext * fc))
 {
@@ -2119,13 +2381,14 @@ StuffChar(REG(d0,TEXT c),REG(a3,struct FormatContext * fc))
 	}
 }
 
+/* This is the non-varargs variant of LocalSNPrintf() below. */
 static int
 LocalVSNPrintf(STRPTR buffer, int limit, const TEXT * formatString, APTR args)
 {
 	struct FormatContext fc;
 
 	fc.fc_Buffer	= buffer;
-	fc.fc_Limit		= limit-1;
+	fc.fc_Limit		= limit-1;	/* One less character for terminating NUL. */
 	fc.fc_Size		= 0;
 
 	RawDoFmt(formatString,args,(void (*)())StuffChar,&fc);
@@ -2138,7 +2401,10 @@ LocalVSNPrintf(STRPTR buffer, int limit, const TEXT * formatString, APTR args)
 
 /****************************************************************************/
 
-/* Format a string for output. */
+/* Format a string for output. The number of characters which may be
+ * stored in the string cannot exceed what the limit parameter states.
+ * Unless limit is 0, the string will be NUL-terminated.
+ */
 void VARARGS68K
 LocalSNPrintf(STRPTR buffer, int limit, const TEXT * formatString,...)
 {
@@ -2162,7 +2428,7 @@ LocalSNPrintf(STRPTR buffer, int limit, const TEXT * formatString,...)
 /****************************************************************************/
 
 /* NetBIOS broadcast name query code courtesy of Christopher R. Hertel.
- * Thanks very much, Chris!
+ * Thank you very much, Chris!
  */
 struct addr_entry
 {
@@ -2768,16 +3034,72 @@ find_file_node_by_name(const TEXT * name,const struct FileNode * skip)
 	struct FileNode * result = NULL;
 	struct FileNode * fn;
 
-	for(fn = (struct FileNode *)FileList.mlh_Head ;
-	    fn->fn_MinNode.mln_Succ != NULL ;
-	    fn = (struct FileNode *)fn->fn_MinNode.mln_Succ)
+	ASSERT( name != NULL );
+
+	#ifndef USE_SPLAY_TREE
 	{
-		if(fn != skip && compare_names(name,fn->fn_FullName) == SAME)
+		D(("searching for file with name '%s'", name));
+
+		for(fn = (struct FileNode *)FileList.mlh_Head ;
+		    fn->fn_MinNode.mln_Succ != NULL ;
+		    fn = (struct FileNode *)fn->fn_MinNode.mln_Succ)
 		{
-			result = fn;
-			break;
+			if(fn != skip && compare_names(name,fn->fn_FullName) == SAME)
+			{
+				result = fn;
+				break;
+			}
+		}
+
+		if(result != NULL)
+			D(("found it (= 0x%08lx)", result));
+		else
+			D(("didn't find it"));
+	}
+	#else
+	{
+		struct splay_node * sn;
+
+		D(("looking up file with name '%s'", name));
+
+		/* Find the list of all files which match the given name. */
+		sn = splay_tree_find(&FileNameTree, (splay_key_t)name);
+		if(sn != NULL)
+		{
+			fn = (struct FileNode *)sn->sn_userdata;
+
+			ASSERT( fn != NULL );
+
+			/* Use this entry, unless it's the one which we
+			 * wanted to skip.
+			 */
+			if (fn != skip)
+			{
+				result = fn;
+
+				D(("found it (= 0x%08lx)", result));
+			}
+			/* Use the next entry in the list, if possible. */
+			else if (sn->sn_next != NULL)
+			{
+				result = (struct FileNode *)sn->sn_next->sn_userdata;
+
+				D(("found it, but can't use it, so using the next best entry (= 0x%08lx)", result));
+
+				if(result == NULL)
+					D(("...but didn't actually find it"));
+			}
+			else
+			{
+				D(("didn't find it"));
+			}
+		}
+		else
+		{
+			D(("didn't find it"));
 		}
 	}
+	#endif /* USE_SPLAY_TREE */
 
 	return(result);
 }
@@ -2791,16 +3113,65 @@ find_lock_node_by_name(const TEXT * name,const struct LockNode * skip)
 	struct LockNode * result = NULL;
 	struct LockNode * ln;
 
-	for(ln = (struct LockNode *)LockList.mlh_Head ;
-	    ln->ln_MinNode.mln_Succ != NULL ;
-	    ln = (struct LockNode *)ln->ln_MinNode.mln_Succ)
+	#ifndef USE_SPLAY_TREE
 	{
-		if(ln != skip && compare_names(name,ln->ln_FullName) == SAME)
+		D(("searching for lock with name '%s'", name));
+
+		for(ln = (struct LockNode *)LockList.mlh_Head ;
+		    ln->ln_MinNode.mln_Succ != NULL ;
+		    ln = (struct LockNode *)ln->ln_MinNode.mln_Succ)
 		{
-			result = ln;
-			break;
+			if(ln != skip && compare_names(name,ln->ln_FullName) == SAME)
+			{
+				result = ln;
+				break;
+			}
+		}
+
+		if(result != NULL)
+			D(("found it (= 0x%08lx)", result));
+		else
+			D(("didn't find it"));
+	}
+	#else
+	{
+		struct splay_node * sn;
+
+		D(("looking up lock with name '%s'", name));
+
+		sn = splay_tree_find(&LockNameTree, (splay_key_t)name);
+		if(sn != NULL)
+		{
+			ln = (struct LockNode *)sn->sn_userdata;
+
+			ASSERT( ln != NULL );
+
+			if (ln != skip)
+			{
+				result = ln;
+
+				D(("found it (= 0x%08lx)", result));
+			}
+			else if (sn->sn_next != NULL)
+			{
+				result = (struct LockNode *)sn->sn_next->sn_userdata;
+
+				D(("found it, but can't use it, so using the next best entry (= 0x%08lx)", result));
+
+				if(result == NULL)
+					D(("...but didn't actually find it"));
+			}
+			else
+			{
+				D(("didn't find it"));
+			}
+		}
+		else
+		{
+			D(("didn't find it"));
 		}
 	}
+	#endif /* USE_SPLAY_TREE */
 
 	return(result);
 }
@@ -2852,7 +3223,8 @@ check_access_mode_collision(const TEXT * name,LONG mode)
 }
 
 /* Find out whether there already exists a reference to a
- * certain file or directory.
+ * certain file or directory. Returns an AmigaDOS error
+ * code if so, and 0 otherwise.
  */
 static int
 name_already_in_use(const TEXT * name)
@@ -2883,21 +3255,40 @@ name_already_in_use(const TEXT * name)
 	return(error);
 }
 
-/* Check whether an Amiga file name uses special characters which
- * should be avoided when used with the SMB file sharing protocol.
+/* Check whether an AmigaDOS path name uses special characters which should be
+ * avoided when used with the SMB file sharing protocol. This test accepts '/'
+ * and ':' as valid characters that may appear in an AmigaDOS path name.
+ *
+ * Reserved characters are control codes in the range 0..31, as well as
+ * '<' (less than), '>' (greater than), ':' (colon), '"' (double quote),
+ * '/' (forward slash), '\' (backslash), '|' (vertical bar or pipe),
+ * '?' (question mark) and '*' (asterisk). The '?' and '*' are the MS-DOS
+ * wildcard pattern characters which the SMB delete and rename commands
+ * would process if they were part of the "file name".
+ *
+ * This list can be found (2018-12-28) here:
+ *    https://docs.microsoft.com/en-us/windows/desktop/fileio/naming-a-file
+ *
+ * We also reject the use of "." and ".." as path names.
  */
 static BOOL
-is_reserved_name(const TEXT * name)
+path_name_is_invalid(const TEXT * name, int name_len)
 {
 	BOOL result = TRUE;
+	TEXT c;
+	int i;
 
 	/* Disallow "." and "..". */
-	if(name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))
+	if((name_len == 1 && name[0] == '.') || (name_len == 1 && name[0] == '.' && name[1] == '.'))
 		goto out;
 
-	/* Disallow the use of the backslash in file names. */
-	if(strchr(name,SMB_PATH_SEPARATOR) != NULL)
-		goto out;
+	for(i = 0 ; i < name_len ; i++)
+	{
+		c = name[i];
+		
+		if(c < ' ' || strchr("<>\"\\|?*", c) != NULL)
+			goto out;
+	}
 
 	result = FALSE;
 
@@ -3089,7 +3480,7 @@ is_valid_device_name(const TEXT * name, int len)
 /****************************************************************************/
 
 /* Check if a file name is right and proper for AmigaDOS use,
- * which excludes the use unprintable characters, the path
+ * which excludes the use of unprintable characters, the path
  * delimiters ':' and '/', but also the SMB path delimeter
  * character '\'.
  *
@@ -3131,7 +3522,9 @@ validate_amigados_file_name(const TEXT * name,int len)
 
 /* Pick up all the DOS packets waiting to be processed and
  * return them with an error, claiming that the packet cannot
- * be processed.
+ * be processed. This is used while the file system has been
+ * disabled, to avoid packets piling up which are not going
+ * to be processed any time soon.
  */
 static void
 reject_all_pending_packets(struct MsgPort * port)
@@ -3199,7 +3592,9 @@ really_remove_dosentry(struct DosList * entry)
 	{
 		dl = AttemptLockDosList(LDF_WRITE|kind);
 
-		/* Workaround for dos.library bug... */
+		/* Workaround for dos.library bug present in
+		 * Kickstart 2.0 through Kickstart 3.0.
+		 */
 		if(((ULONG)dl) == 1)
 			dl = NULL;
 
@@ -3417,6 +3812,32 @@ cleanup(void)
 	LEAVE();
 }
 
+/*****************************************************************************/
+
+#ifdef USE_SPLAY_TREE
+
+/* This is used by the splay tree functions to compare the
+ * file and lock node addresses.
+ */
+static int
+compare_file_or_lock_by_address(const BYTE * a, const BYTE * b)
+{
+	int result;
+
+	if (a < b)
+		result = -1;
+	else if (a == b)
+		result = 0;
+	else
+		result = 1;
+
+	return(result);
+}
+
+#endif /* USE_SPLAY_TREE */
+
+/*****************************************************************************/
+
 /* Allocate all the necessary resources to get going. */
 static BOOL
 setup(
@@ -3439,8 +3860,15 @@ setup(
 	BOOL			opt_prefer_core_protocol,
 	BOOL			opt_session_setup_delay_unicode,
 	BOOL			opt_write_behind,
+	int				opt_smb_request_write_threshold,
+	int				opt_smb_request_read_threshold,
+	BOOL			opt_scatter_gather,
+	BOOL			opt_tcp_no_delay,
+	int				opt_socket_receive_buffer_size,
+	int				opt_socket_send_buffer_size,
 	const TEXT *	device_name,
 	const TEXT *	volume_name,
+	BOOL			opt_add_volume,
 	const TEXT *	translation_file)
 {
 	BOOL result = FALSE;
@@ -3450,6 +3878,7 @@ setup(
 	const TEXT * actual_volume_name;
 	int actual_volume_name_len;
 	TEXT name[MAX_FILENAME_LEN+1];
+	smba_connect_parameters_t par;
 	BOOL device_exists = FALSE;
 	int len,i;
 
@@ -3458,7 +3887,23 @@ setup(
 	NewList((struct List *)&FileList);
 	NewList((struct List *)&LockList);
 
-	MemoryPool = CreatePool(MEMF_ANY|MEMF_PUBLIC,4096,4096);
+	#ifdef USE_SPLAY_TREE
+	{
+		/* File names may not be unique. */
+		splay_tree_init(&FileNameTree, (splay_key_compare_t)compare_names);
+		FileNameTree.st_allow_duplicates = TRUE;
+
+		splay_tree_init(&FileAddressTree, compare_file_or_lock_by_address);
+
+		/* Lock names may not be unique. */
+		splay_tree_init(&LockNameTree, (splay_key_compare_t)compare_names);
+		LockNameTree.st_allow_duplicates = TRUE;
+
+		splay_tree_init(&LockAddressTree, compare_file_or_lock_by_address);
+	}
+	#endif /* USE_SPLAY_TREE */
+
+	MemoryPool = CreatePool(MEMF_ANY|MEMF_PUBLIC, 4096, 4096);
 	if(MemoryPool == NULL)
 	{
 		report_error("Could not create memory pool.");
@@ -3584,11 +4029,28 @@ setup(
 		file = Open(translation_file,MODE_OLDFILE);
 		if(file != ZERO)
 		{
-			if(Read(file,map_amiga_to_smb_name,256) != 256 ||
-			   Read(file,map_smb_to_amiga_name,256) != 256)
+			LONG num_bytes_read = 0;
+			LONG n;
+
+			n = Read(file,map_amiga_to_smb_name,256);
+			if(n == 256)
+			{
+				num_bytes_read += n;
+
+				n = Read(file,map_smb_to_amiga_name,256);
+				if(n > 0)
+					num_bytes_read += n;
+			}
+
+			if(n < 0)
 			{
 				msg = "Could not read translation file";
+
 				error = IoErr();
+			}
+			else if (num_bytes_read < 512)
+			{
+				msg = "Translation file is too short";
 			}
 
 			Close(file);
@@ -3599,9 +4061,14 @@ setup(
 			error = IoErr();
 		}
 
-		if(msg == NULL)
+		if (msg == NULL)
 		{
 			TranslateNames = TRUE;
+		}
+		else if (error == OK)
+		{
+			report_error("%s '%s'.",msg,translation_file);
+			goto out;
 		}
 		else
 		{
@@ -3620,6 +4087,8 @@ setup(
 		}
 	}
 
+	memset(&par,0,sizeof(par));
+
 	if(smba_start(
 		service,
 		workgroup,
@@ -3636,9 +4105,16 @@ setup(
 		CaseSensitive,
 		opt_session_setup_delay_unicode,
 		opt_write_behind,
+		opt_smb_request_write_threshold,
+		opt_smb_request_read_threshold,
+		opt_scatter_gather,
+		opt_tcp_no_delay,
+		opt_socket_receive_buffer_size,
+		opt_socket_send_buffer_size,
 		&error,
 		&smb_error_class,
 		&smb_error,
+		&par,
 		&ServerData) < 0)
 	{
 		goto out;
@@ -3652,7 +4128,8 @@ setup(
 	}
 
 	/* If a device name was provided, check whether it is
-	 * well-formed.
+	 * well-formed, and whether a device of that name
+	 * already exists.
 	 */
 	if(device_name != NULL)
 	{
@@ -3673,9 +4150,15 @@ setup(
 
 		dl = LockDosList(LDF_WRITE|LDF_VOLUMES|LDF_DEVICES);
 
+		/* Does this device name already exist? Note that
+		 * device names must be unique.
+		 */
 		if(FindDosEntry(dl,name,LDF_DEVICES) != NULL)
 			device_exists = TRUE;
 	}
+	/* Otherwise pick a device name of the form SMBFS0..SMBFS99,
+	 * which is not currently in use.
+	 */
 	else
 	{
 		dl = LockDosList(LDF_WRITE|LDF_VOLUMES|LDF_DEVICES);
@@ -3713,6 +4196,12 @@ setup(
 	}
 
 	DeviceNode->dol_Task = FileSystemPort;
+
+	/* If requested, add a volume name, using the service
+	 * name as the default value.
+	 */
+	if(opt_add_volume && volume_name == NULL)
+		volume_name = par.service;
 
 	/* Examine the volume name; make sure that it is
 	 * well-formed.
@@ -3785,7 +4274,8 @@ setup(
 	if(VolumeNodeAdded)
 		send_disk_change_notification(IECLASS_DISKINSERTED);
 
-	SetProgramName(NewProgramName);
+	if(Cli() != NULL)
+		SetProgramName(NewProgramName);
 
 	result = TRUE;
 
@@ -3793,6 +4283,108 @@ setup(
 
 	RETURN(result);
 	return(result);
+}
+
+/****************************************************************************/
+
+static void
+add_file_node(struct FileNode * fn)
+{
+	ASSERT( fn != NULL );
+
+	AddTail((struct List *)&FileList,(struct Node *)fn);
+
+	#ifdef USE_SPLAY_TREE
+	{
+		fn->fn_SplayNameNode.sn_key = (splay_key_t)fn->fn_FullName;
+		fn->fn_SplayNameNode.sn_userdata = fn;
+		splay_tree_add(&FileNameTree, &fn->fn_SplayNameNode);
+
+		fn->fn_SplayAddressNode.sn_key = (splay_key_t)fn;
+		fn->fn_SplayAddressNode.sn_userdata = fn;
+		splay_tree_add(&FileAddressTree, &fn->fn_SplayAddressNode);
+	}
+	#endif /* USE_SPLAY_TREE */
+}
+
+/****************************************************************************/
+
+static void
+remove_file_node(struct FileNode * fn)
+{
+	ASSERT( fn != NULL );
+
+	Remove((struct Node *)fn);
+
+	#ifdef USE_SPLAY_TREE
+	{
+		APTR found;
+
+		found = splay_tree_remove(&FileNameTree, &fn->fn_SplayNameNode, (splay_key_t)fn->fn_FullName);
+
+		D(("file name node removal %s", found != NULL ? "succeeded" : "failed"));
+
+		found = splay_tree_remove(&FileAddressTree, NULL, (splay_key_t)fn);
+
+		D(("file address node removal %s", found != NULL ? "succeeded" : "failed"));
+	}
+	#endif /* USE_SPLAY_TREE */
+}
+
+/****************************************************************************/
+
+static void
+add_lock_node(struct LockNode * ln)
+{
+	ASSERT( ln != NULL );
+
+	AddTail((struct List *)&LockList,(struct Node *)ln);
+
+	#ifdef USE_SPLAY_TREE
+	{
+		ln->ln_SplayNameNode.sn_key = (splay_key_t)ln->ln_FullName;
+		ln->ln_SplayNameNode.sn_userdata = ln;
+		splay_tree_add(&LockNameTree, &ln->ln_SplayNameNode);
+
+		ln->ln_SplayAddressNode.sn_key = (splay_key_t)ln;
+		ln->ln_SplayAddressNode.sn_userdata = ln;
+		splay_tree_add(&LockAddressTree, &ln->ln_SplayAddressNode);
+	}
+	#endif /* USE_SPLAY_TREE */
+}
+
+/****************************************************************************/
+
+static void
+remove_lock_node(struct LockNode * ln)
+{
+	ASSERT( ln != NULL );
+
+	Remove((struct Node *)ln);
+
+	#ifdef USE_SPLAY_TREE
+	{
+		APTR found;
+
+		found = splay_tree_remove(&LockNameTree, &ln->ln_SplayNameNode, ln->ln_SplayNameNode.sn_key);
+
+		D(("lock name node removal %s", found != NULL ? "succeeded" : "failed"));
+
+		found = splay_tree_remove(&LockAddressTree, NULL, (splay_key_t)ln);
+
+		D(("lock address node removal %s", found != NULL ? "succeeded" : "failed"));
+	}
+	#endif /* USE_SPLAY_TREE */
+
+	/* This will make the lock_is_invalid() tests return
+	 * TRUE, which should make it easier to detect
+	 * files which have been closed already, should the
+	 * file system receive them.
+	 */
+	ln->ln_FileLock.fl_Volume = (BPTR)NULL;
+	ln->ln_FileLock.fl_Key = 0;
+	ln->ln_File = NULL;
+	ln->ln_Magic = 0;
 }
 
 /****************************************************************************/
@@ -3823,8 +4415,8 @@ truncate_64_bit_position(const QUAD * position_quad)
  * characters through the use of 'C' style escape sequences. Returns a
  * pointer to a local static buffer which contains the escaped string.
  * If the escape form of the name is too long to fit into the buffer,
- * the text " [...]" will be appended to contents of the buffer, to indicate
- * that the name was truncated.
+ * the text " [...]" will be appended to the contents of the buffer, to
+ * indicate that the name was truncated.
  */
 TEXT *
 escape_name(const TEXT * name)
@@ -3947,6 +4539,8 @@ escape_name(const TEXT * name)
 		len += sizeof(truncated_suffix)-1;
 	}
 
+	ASSERT( len < (int)sizeof(buffer) );
+
 	buffer[len] = '\0';
 
 	return(buffer);
@@ -3956,7 +4550,10 @@ escape_name(const TEXT * name)
 
 /****************************************************************************/
 
-/* Convert a BCPL string into a standard NUL-terminated 'C' string. */
+/* Convert a BCPL string into a standard NUL-terminated 'C' string.
+ * Note that these must be different strings which must not
+ * overlap!
+ */
 static int
 convert_from_bcpl_to_c_string(STRPTR cstring,int cstring_size,const void * bstring)
 {
@@ -3992,8 +4589,8 @@ convert_from_c_to_bcpl_string(void * bstring,int bstring_size,const TEXT * cstri
 
 	if(bstring_size > 0)
 	{
-		if(bstring_size > 256)
-			bstring_size = 256;
+		if(bstring_size > MAX_FILENAME_LEN+1)
+			bstring_size = MAX_FILENAME_LEN+1;
 
 		if(len > bstring_size-1)
 			len = bstring_size-1;
@@ -4672,6 +5269,13 @@ get_parent_dir_name(const TEXT * name,int name_len,STRPTR * parent_name_ptr)
 /* Translate an Amiga file name into an encoded form, such as
  * through a code page translation table. The file name provided will
  * be modified in place and may become longer than it already is.
+ *
+ * Note that if code page based file name translation is disabled
+ * then this function will do nothing and leave the file name
+ * unchanged.
+ *
+ * This function returns an AmigaDOS error code if the translation
+ * cannot be performed and 0 otherwise.
  */
 static int
 translate_amiga_name_to_smb_name(TEXT * name, int name_len, int name_size)
@@ -4714,6 +5318,9 @@ translate_amiga_name_to_smb_name(TEXT * name, int name_len, int name_size)
  * through a code page translation table, into a form suitable
  * for use with AmigaDOS. The file name provided will be modified
  * in place and may become longer than it already is.
+ *
+ * This function returns an AmigaDOS error code if the translation
+ * cannot be performed and 0 otherwise.
  */
 static int
 translate_smb_name_to_amiga_name(TEXT * name, int name_len, int name_size)
@@ -4766,28 +5373,57 @@ static void
 restart_directory_scanning(const struct MsgPort * user,const TEXT * parent_dir_name)
 {
 	struct LockNode * ln;
+	struct splay_node * sn;
 
 	ENTER();
 
 	SHOWSTRING(parent_dir_name);
 
-	for(ln = (struct LockNode *)LockList.mlh_Head ;
-	    ln->ln_MinNode.mln_Succ != NULL ;
-	    ln = (struct LockNode *)ln->ln_MinNode.mln_Succ)
+	#ifndef USE_SPLAY_TREE
 	{
-		/* Try not to self-disrupt directory scanning while
-		 * deleting the contents of the directory.
-		 */
-		if(ln->ln_LastUser == user)
-			continue;
-
-		if(compare_names(parent_dir_name,ln->ln_FullName) == SAME)
+		for(ln = (struct LockNode *)LockList.mlh_Head ;
+		    ln->ln_MinNode.mln_Succ != NULL ;
+		    ln = (struct LockNode *)ln->ln_MinNode.mln_Succ)
 		{
-			D(("restart scanning for '%s'", escape_name(ln->ln_FullName)));
+			/* Try not to self-disrupt directory scanning while
+			 * deleting the contents of the directory.
+			 */
+			if(ln->ln_LastUser == user)
+				continue;
 
-			ln->ln_RestartExamine = TRUE;
+			if(compare_names(parent_dir_name,ln->ln_FullName) == SAME)
+			{
+				D(("restart scanning for '%s'", escape_name(ln->ln_FullName)));
+
+				ln->ln_RestartExamine = TRUE;
+			}
 		}
 	}
+	#else
+	{
+		/* Find all the locks which share the same directory name. */
+		sn = splay_tree_find(&LockNameTree, (splay_key_t)parent_dir_name);
+		if(sn != NULL)
+		{
+			/* Check each lock in turn, restarting the directory
+			 * scanning process unless the same program which
+			 * requires the restart is the one currently
+			 * doing the scanning.
+			 */
+			for((void)NULL ; sn != NULL ; sn = sn->sn_next)
+			{
+				ln = sn->sn_userdata;
+
+				if(ln->ln_LastUser != user)
+				{
+					D(("restart scanning for '%s'", escape_name(ln->ln_FullName)));
+
+					ln->ln_RestartExamine = TRUE;
+				}
+			}
+		}
+	}
+	#endif /* USE_SPLAY_TREE */
 
 	LEAVE();
 }
@@ -4797,8 +5433,10 @@ restart_directory_scanning(const struct MsgPort * user,const TEXT * parent_dir_n
 /* Check if a file lock was not created by this file system
  * through CreateDir(), Lock(), ParentDir(), ParentOfFH(),
  * DupLock() or DupLockFromFH(). Returns TRUE if this is case,
- * FALSE otherwise. If this function returns FALSE, then the
- * file lock has a valid LockNode attached.
+ * FALSE otherwise.
+ *
+ * If this function returns FALSE, then the file lock has a
+ * valid LockNode attached.
  *
  * Note that the ZERO lock is always rejected as invalid
  * by this function.
@@ -4900,48 +5538,6 @@ file_is_invalid(const struct FileNode * fn,int * error_ptr)
 		(*error_ptr) = error;
 
 	return(is_invalid);
-}
-
-/****************************************************************************/
-
-/****************************************************************************/
-
-/* Check if the name of a file or drawer contains MS-DOS
- * wildcard characters ("?" and "*") which may not be
- * suitable for some file system operations, e.g. rename
- * or delete.
- */
-static BOOL
-name_contains_wildcard_characters(const TEXT * name)
-{
-	const TEXT * file_name;
-	BOOL result = FALSE;
-	int len;
-	TEXT c;
-	int i;
-
-	ENTER();
-
-	SHOWSTRING(name);
-
-	file_name = FilePart(name);
-	len = strlen(file_name);
-
-	for(i = 0 ; i < len ; i++)
-	{
-		c = file_name[i];
-
-		if(c == '?' || c == '*')
-		{
-			D(("found a wildcard in '%s'",name));
-
-			result = TRUE;
-			break;
-		}
-	}
-
-	RETURN(result);
-	return(result);
 }
 
 /****************************************************************************/
@@ -5073,7 +5669,8 @@ Action_Parent(
 				goto out;
 			}
 
-			AddTail((struct List *)&LockList,(struct Node *)ln);
+			add_lock_node(ln);
+
 			result = MKBADDR(&ln->ln_FileLock);
 			SHOWVALUE(&ln->ln_FileLock);
 
@@ -5145,19 +5742,10 @@ Action_DeleteObject(
 	 */
 	name_len = convert_from_bcpl_to_c_string(name,sizeof(name),bcpl_name);
 
-	/* The SMB_COM_DELETE command supports deleting sets
-	 * of matching files/drawers through wildcards. Only
-	 * the last part of the path (the name of the file
-	 * or directory) may contain the wildcard.
-	 */
-	if(name_contains_wildcard_characters(name))
+	if(path_name_is_invalid(name, name_len))
 	{
-		D(("name '%s' is not safe to use with delete operation", name));
-
-		/* Do not try to delete sets of matching files
-		 * and drawers. We only came to delete a single
-		 * directory entry.
-		 */
+		D(("'%s' is not a valid path name", name));
+		
 		error = ERROR_OBJECT_NOT_FOUND;
 		goto out;
 	}
@@ -5337,14 +5925,10 @@ Action_CreateDir(
 
 	name_len = convert_from_bcpl_to_c_string(name,sizeof(name),bcpl_name);
 
-	/* Do not allow for a directory to be created whose
-	 * name contains MS-DOS wildcard characters. This will
-	 * only end in tears later...
-	 */
-	if(name_contains_wildcard_characters(name))
+	if(path_name_is_invalid(name, name_len))
 	{
-		D(("will not create a directory '%s' which contains wildcard characters", name));
-
+		D(("'%s' is not a valid path name", name));
+		
 		error = ERROR_INVALID_COMPONENT_NAME;
 		goto out;
 	}
@@ -5412,7 +5996,8 @@ Action_CreateDir(
 		goto out;
 	}
 
-	AddTail((struct List *)&LockList,(struct Node *)ln);
+	add_lock_node(ln);
+
 	result = MKBADDR(&ln->ln_FileLock);
 	SHOWVALUE(&ln->ln_FileLock);
 
@@ -5468,17 +6053,19 @@ Action_LocateObject(
 
 	name_len = convert_from_bcpl_to_c_string(name,sizeof(name),bcpl_name);
 
+	if(path_name_is_invalid(name, name_len))
+	{
+		D(("'%s' is not a valid path name", name));
+		
+		error = ERROR_OBJECT_NOT_FOUND;
+		goto out;
+	}
+
 	if(NOT ServerData->server.unicode_enabled)
 	{
 		error = translate_amiga_name_to_smb_name(name,name_len,sizeof(name));
 		if(error != OK)
 			goto out;
-	}
-
-	if(is_reserved_name(FilePart(name)))
-	{
-		error = ERROR_OBJECT_NOT_FOUND;
-		goto out;
 	}
 
 	error = build_full_path_name(parent_name,name,name_len,&full_name);
@@ -5502,7 +6089,8 @@ Action_LocateObject(
 		goto out;
 	}
 
-	AddTail((struct List *)&LockList,(struct Node *)ln);
+	add_lock_node(ln);
+
 	result = MKBADDR(&ln->ln_FileLock);
 	SHOWVALUE(&ln->ln_FileLock);
 
@@ -5616,7 +6204,8 @@ Action_CopyDir(
 		goto out;
 	}
 
-	AddTail((struct List *)&LockList,(struct Node *)ln);
+	add_lock_node(ln);
+
 	result = MKBADDR(&ln->ln_FileLock);
 	SHOWVALUE(&ln->ln_FileLock);
 
@@ -5658,6 +6247,7 @@ Action_FreeLock(
 		const struct LockNode * key;
 		struct LockNode * found;
 		struct LockNode * ln;
+		struct splay_node * sn;
 
 		if(file_system_disabled)
 		{
@@ -5674,16 +6264,36 @@ Action_FreeLock(
 
 		D(("lock on '%s'", escape_name(key->ln_FullName)));
 
-		for(ln = (struct LockNode *)LockList.mlh_Head ;
-			ln->ln_MinNode.mln_Succ != NULL ;
-			ln = (struct LockNode *)ln->ln_MinNode.mln_Succ)
+		#ifndef USE_SPLAY_TREE
 		{
-			if(ln == key)
+			for(ln = (struct LockNode *)LockList.mlh_Head ;
+				ln->ln_MinNode.mln_Succ != NULL ;
+				ln = (struct LockNode *)ln->ln_MinNode.mln_Succ)
 			{
-				found = ln;
-				break;
+				if(ln == key)
+				{
+					found = ln;
+					break;
+				}
 			}
 		}
+		#else
+		{
+			D(("looking up the lock address (what happened to trust?)"));
+
+			sn = splay_tree_find(&LockAddressTree, (splay_key_t)key);
+			if(sn != NULL)
+			{
+				D(("found it"));
+
+				found = (struct LockNode *)sn->sn_userdata;
+			}
+			else
+			{
+				D(("didn't find it (this should never happen)"));
+			}
+		}
+		#endif /* USE_SPLAY_TREE */
 
 		/* This should never happen. */
 		if(found == NULL)
@@ -5692,11 +6302,9 @@ Action_FreeLock(
 			goto out;
 		}
 
-		Remove((struct Node *)found);
-
 		smba_close(ServerData,found->ln_File);
 
-		found->ln_Magic = 0;
+		remove_lock_node(found);
 
 		free_memory(found->ln_FullName);
 		free_memory(found);
@@ -5835,6 +6443,14 @@ Action_SetProtect(
 		goto out;
 
 	name_len = convert_from_bcpl_to_c_string(name,sizeof(name),bcpl_name);
+
+	if(path_name_is_invalid(name, name_len))
+	{
+		D(("'%s' is not a valid path name", name));
+		
+		error = ERROR_OBJECT_NOT_FOUND;
+		goto out;
+	}
 
 	if(NOT ServerData->server.unicode_enabled)
 	{
@@ -5993,18 +6609,10 @@ Action_RenameObject(
 
 	name_len = convert_from_bcpl_to_c_string(name,sizeof(name),source_bcpl_name);
 
-	/* The SMB_COM_RENAME command supports renaming through
-	 * wildcards. Only the last part of the path (the name
-	 * of the file or directory) may contain the wildcard.
-	 */
-	if(name_contains_wildcard_characters(name))
+	if(path_name_is_invalid(name, name_len))
 	{
-		D(("found a wildcard in the source path '%s'; this is unsafe to use with the rename operation",name));
-
-		/* Do not rename/move sets of matching files and
-		 * directories. We only came to rename/move a
-		 * single directory entry.
-		 */
+		D(("'%s' is not a valid path name", name));
+		
 		error = ERROR_OBJECT_NOT_FOUND;
 		goto out;
 	}
@@ -6036,14 +6644,10 @@ Action_RenameObject(
 
 	name_len = convert_from_bcpl_to_c_string(name,sizeof(name),destination_bcpl_name);
 
-	if(name_contains_wildcard_characters(name))
+	if(path_name_is_invalid(name, name_len))
 	{
-		D(("found a wildcard in the destination path '%s'; this is unsafe to use with the rename operation",name));
-
-		/* Do not allow the destination name to contain
-		 * MS-DOS wildcard characters. This will only end
-		 * in tears later...
-		 */
+		D(("'%s' is not a valid path name", name));
+		
 		error = ERROR_INVALID_COMPONENT_NAME;
 		goto out;
 	}
@@ -6474,7 +7078,7 @@ Action_ExamineObject(
 	#if DEBUG
 	{
 		struct DateTime dat;
-		TEXT date[LEN_DATSTRING],time[LEN_DATSTRING];
+		TEXT date[2 * LEN_DATSTRING],time[2 * LEN_DATSTRING];
 
 		memset(&dat,0,sizeof(dat));
 
@@ -6482,7 +7086,7 @@ Action_ExamineObject(
 		memset(time,0,sizeof(time));
 
 		dat.dat_Stamp	= fib->fib_Date;
-		dat.dat_Format	= FORMAT_DEF;
+		dat.dat_Format	= FORMAT_DOS;
 		dat.dat_StrDate	= date;
 		dat.dat_StrTime	= time;
 
@@ -6494,6 +7098,9 @@ Action_ExamineObject(
 		{
 			D(("could not convert days=%ld/minutes=%ld/ticks=%ld", fib->fib_Date.ds_Days, fib->fib_Date.ds_Minute, fib->fib_Date.ds_Tick));
 		}
+
+		ASSERT( strlen(date) < sizeof(date) );
+		ASSERT( strlen(time) < sizeof(time) );
 	}
 	#endif /* DEBUG */
 
@@ -6676,7 +7283,7 @@ dir_scan_callback_func_exnext(
 	#if DEBUG
 	{
 		struct DateTime dat;
-		TEXT date[LEN_DATSTRING],time[LEN_DATSTRING];
+		TEXT date[2 * LEN_DATSTRING],time[2 * LEN_DATSTRING];
 
 		memset(&dat,0,sizeof(dat));
 
@@ -6684,7 +7291,7 @@ dir_scan_callback_func_exnext(
 		memset(time,0,sizeof(time));
 
 		dat.dat_Stamp	= fib->fib_Date;
-		dat.dat_Format	= FORMAT_DEF;
+		dat.dat_Format	= FORMAT_DOS;
 		dat.dat_StrDate	= date;
 		dat.dat_StrTime	= time;
 
@@ -6696,6 +7303,9 @@ dir_scan_callback_func_exnext(
 		{
 			D(("   could not convert days=%ld/minutes=%ld/ticks=%ld", fib->fib_Date.ds_Days, fib->fib_Date.ds_Minute, fib->fib_Date.ds_Tick));
 		}
+
+		ASSERT( strlen(date) < sizeof(date) );
+		ASSERT( strlen(time) < sizeof(time) );
 	}
 	#endif /* DEBUG */
 
@@ -6813,15 +7423,39 @@ Action_ExamineNext(
 
 /****************************************************************************/
 
+/* This is used by the dir_scan_callback_func_exall() function which needs
+ * to add new records to the buffer provided to the ExAll() function.
+ */
 struct ExAllContext
 {
-	struct ExAllData *		ec_Last;
-	UBYTE *					ec_Buffer;
-	int						ec_BufferSize;
-	int						ec_RecordSize;
-	struct ExAllControl *	ec_Control;
-	LONG					ec_Type;
-	LONG					ec_Error;
+	struct ExAllData *		ec_Last;		/* Points to last ExAllData
+											 * record, which may need to
+											 * be linked up the next
+											 * record that is added.
+											 */
+	UBYTE *					ec_Buffer;		/* This is the buffer we need
+											 * to fill.
+											 */
+	int						ec_BufferSize;	/* How much room there is in
+											 * the buffer.
+											 */
+	int						ec_RecordSize;	/* Each ExAllData record has the
+											 * same header size, and the
+											 * type of information returned
+											 * controls how large that header
+											 * is. Here is the header size
+											 * we have to use.
+											 */
+	struct ExAllControl *	ec_Control;		/* This was passed to the
+											 * ExAll() function.
+											 */
+	LONG					ec_Type;		/* This was passed to the
+											 * ExAll() function.
+											 */
+	LONG					ec_Error;		/* If the scanning process has to
+											 * be stopped, this is where the
+											 * error returned will go.
+											 */
 };
 
 /* This function is called for every directory entry the directory scanner
@@ -6873,7 +7507,7 @@ dir_scan_callback_func_exall(
 		st_size_quad.High	= st->size_high;
 
 		D((" '%s'",escape_name(name)));
-		D(("   is directory=%s, is read-only=%ls, is hidden=%s, size=%s", st->is_dir ? "yes" : "no",st->is_read_only ? "yes" : "no",st->is_hidden ? "yes" : "no",convert_quad_to_string(&st_size_quad)));
+		D(("   is directory=%s, is read-only=%s, is hidden=%s, size=%s", st->is_dir ? "yes" : "no",st->is_read_only ? "yes" : "no",st->is_hidden ? "yes" : "no",convert_quad_to_string(&st_size_quad)));
 		D(("   next_pos=%ld eof=%ld",next_pos,eof));
 	}
 	#endif /* DEBUG */
@@ -7031,7 +7665,7 @@ dir_scan_callback_func_exall(
 		/* Careful: the 'archive' attribute has exactly the opposite
 		 *          meaning in the Amiga and the SMB worlds.
 		 */
-		D(("   was changed since last_archive = %s",st->was_changed_since_last_archive ? "yes" : "no"));
+		D(("   was changed since last archive = %s",st->was_changed_since_last_archive ? "yes" : "no"));
 
 		if(NOT st->was_changed_since_last_archive)
 			ed->ed_Prot |= FIBF_ARCHIVE;
@@ -7057,7 +7691,7 @@ dir_scan_callback_func_exall(
 		#if DEBUG
 		{
 			struct DateTime dat;
-			TEXT date[LEN_DATSTRING],time[LEN_DATSTRING];
+			TEXT date[2 * LEN_DATSTRING],time[2 * LEN_DATSTRING];
 
 			memset(&dat,0,sizeof(dat));
 
@@ -7067,7 +7701,7 @@ dir_scan_callback_func_exall(
 			dat.dat_Stamp.ds_Days	= ed->ed_Days;
 			dat.dat_Stamp.ds_Minute	= ed->ed_Mins;
 			dat.dat_Stamp.ds_Tick	= ed->ed_Ticks;
-			dat.dat_Format			= FORMAT_DEF;
+			dat.dat_Format			= FORMAT_DOS;
 			dat.dat_StrDate			= date;
 			dat.dat_StrTime			= time;
 
@@ -7079,6 +7713,9 @@ dir_scan_callback_func_exall(
 			{
 				D(("   could not convert days=%ld/minutes=%ld/ticks=%ld", ed->ed_Days, ed->ed_Mins, ed->ed_Ticks));
 			}
+
+			ASSERT( strlen(date) < sizeof(date) );
+			ASSERT( strlen(time) < sizeof(time) );
 		}
 		#endif /* DEBUG */
 	}
@@ -7512,7 +8149,6 @@ Action_Find(
 	struct FileNode * fn = NULL;
 	STRPTR parent_name;
 	TEXT name[MAX_FILENAME_LEN+1];
-	BOOL wildcard_characters_found_in_name = FALSE;
 	int name_len;
 	BOOL create_new_file = FALSE;
 	STRPTR temp = NULL;
@@ -7552,28 +8188,16 @@ Action_Find(
 
 	name_len = convert_from_bcpl_to_c_string(name,sizeof(name),bcpl_name);
 
-	/* Do not allow MS-DOS wildcard characters to be used
-	 * when creating a new file.
-	 */
-	if(action != ACTION_FINDINPUT)
+	if(path_name_is_invalid(name, name_len))
 	{
-		if(name_contains_wildcard_characters(name))
-		{
-			if(action == ACTION_FINDOUTPUT)
-			{
-				D(("will not create a file with wildcard characters in its name"));
+		D(("'%s' is not a valid path name", name));
 
-				error = ERROR_INVALID_COMPONENT_NAME;
-				goto out;
-			}
+		if(action == ACTION_FINDINPUT)
+			error = ERROR_OBJECT_NOT_FOUND;
+		else
+			error = ERROR_INVALID_COMPONENT_NAME;
 
-			/* We don't know yet if MODE_READWRITE will
-			 * succeed in opening the file whose name
-			 * contains wildcard characters. This will
-			 * be checked later, if needed.
-			 */
-			wildcard_characters_found_in_name = TRUE;
-		}
+		goto out;
 	}
 
 	if(NOT ServerData->server.unicode_enabled)
@@ -7581,12 +8205,6 @@ Action_Find(
 		error = translate_amiga_name_to_smb_name(name,name_len,sizeof(name));
 		if(error != OK)
 			goto out;
-	}
-
-	if(is_reserved_name(FilePart(name)))
-	{
-		error = ERROR_OBJECT_NOT_FOUND;
-		goto out;
 	}
 
 	error = build_full_path_name(parent_name,name,name_len,&full_name);
@@ -7650,16 +8268,6 @@ Action_Find(
 		if(WriteProtected)
 		{
 			error = ERROR_DISK_WRITE_PROTECTED;
-			goto out;
-		}
-
-		/* Do not create a file whose name would contain
-		 * MS-DOS wildcard characters. This will only
-		 * end in tears later...
-		 */
-		if(wildcard_characters_found_in_name)
-		{
-			error = ERROR_INVALID_COMPONENT_NAME;
 			goto out;
 		}
 
@@ -7734,7 +8342,8 @@ Action_Find(
 
 	fh->fh_Arg1 = (LONG)fn;
 
-	AddTail((struct List *)&FileList,(struct Node *)fn);
+	add_file_node(fn);
+
 	result = DOSTRUE;
 
 	full_name = NULL;
@@ -7872,6 +8481,7 @@ Action_End(
 	LONG result = DOSFALSE;
 	struct FileNode * fn;
 	struct FileNode * found;
+	struct splay_node * sn;
 	int error = OK;
 
 	ENTER();
@@ -7887,18 +8497,42 @@ Action_End(
 
 	D(("file opened on '%s'", escape_name(which_fn->fn_FullName)));
 
+	/* Make sure that the file is still open. This is to avoid
+	 * trouble if the client ends up trying to close the
+	 * same file twice.
+	 */
 	found = NULL;
 
-	for(fn = (struct FileNode *)FileList.mlh_Head ;
-	    fn->fn_MinNode.mln_Succ != NULL ;
-	    fn = (struct FileNode *)fn->fn_MinNode.mln_Succ)
+	#ifndef USE_SPLAY_TREE
 	{
-		if(fn == which_fn)
+		for(fn = (struct FileNode *)FileList.mlh_Head ;
+		    fn->fn_MinNode.mln_Succ != NULL ;
+		    fn = (struct FileNode *)fn->fn_MinNode.mln_Succ)
 		{
-			found = fn;
-			break;
+			if(fn == which_fn)
+			{
+				found = fn;
+				break;
+			}
 		}
 	}
+	#else
+	{
+		D(("looking up the file address (what happened to trust?)"));
+
+		sn = splay_tree_find(&FileAddressTree, (splay_key_t)which_fn);
+		if(sn != NULL)
+		{
+			D(("found it"));
+
+			found = (struct FileNode *)sn->sn_userdata;
+		}
+		else
+		{
+			D(("didn't find it (this should never happen)"));
+		}
+	}
+	#endif /* USE_SPLAY_TREE */
 
 	if(found == NULL)
 	{
@@ -7908,10 +8542,15 @@ Action_End(
 		goto out;
 	}
 
-	Remove((struct Node *)found);
+	remove_file_node(found);
 
 	smba_close(ServerData,found->fn_File);
 
+	/* This will make the file_is_invalid() tests return
+	 * TRUE, which should make it easier to detect
+	 * files which have been closed already, should the
+	 * file system receive them.
+	 */
 	found->fn_Magic = 0;
 
 	free_memory(found->fn_FullName);
@@ -7989,9 +8628,37 @@ Action_Seek(
 
 		default:
 
+			D(("seek mode %ld not known", mode));
+
 			error = ERROR_ACTION_NOT_KNOWN;
 			goto out;
 	}
+
+	#if DEBUG
+	{
+		const TEXT * mode_name;
+
+		switch(mode)
+		{
+			case OFFSET_BEGINNING:
+
+				mode_name = "OFFSET_BEGINNING";
+				break;
+
+			case OFFSET_CURRENT:
+
+				mode_name = "OFFSET_CURRENT";
+				break;
+
+			default:
+
+				mode_name = "OFFSET_END";
+				break;
+		}
+
+		D(("Seek(..., %ld, %s); current position = %s", position, mode_name, convert_quad_to_string(&reference_position_quad)));
+	}
+	#endif /* DEBUG */
 
 	if(position < 0)
 	{
@@ -8003,6 +8670,8 @@ Action_Seek(
 		/* We cannot seek back beyond the beginning of the file. */
 		if(compare_64_to_64(&reference_position_quad,&position_quad) < 0)
 		{
+			D(("cannot seek back beyond the beginning of the file."));
+
 			error = ERROR_SEEK_ERROR;
 			goto out;
 		}
@@ -8014,6 +8683,8 @@ Action_Seek(
 		/* Careful, we need to check for overflow, too. */
 		if(add_64_plus_32_to_64(&reference_position_quad,position,&new_position_quad) > 0)
 		{
+			D(("position is too large"));
+
 			error = ERROR_SEEK_ERROR;
 			goto out;
 		}
@@ -8024,6 +8695,8 @@ Action_Seek(
 	fn->fn_OffsetQuad = new_position_quad;
 
 	result = truncate_64_bit_position(&previous_position_quad);
+
+	D(("new position = %s; returning %ld", convert_quad_to_string(&new_position_quad), result));
 
  out:
 
@@ -8195,6 +8868,14 @@ Action_SetDate(
 
 	name_len = convert_from_bcpl_to_c_string(name,sizeof(name),bcpl_name);
 
+	if(path_name_is_invalid(name, name_len))
+	{
+		D(("'%s' is not a valid path name", name));
+		
+		error = ERROR_OBJECT_NOT_FOUND;
+		goto out;
+	}
+
 	if(NOT ServerData->server.unicode_enabled)
 	{
 		error = translate_amiga_name_to_smb_name(name,name_len,sizeof(name));
@@ -8232,7 +8913,7 @@ Action_SetDate(
 	#if DEBUG
 	{
 		struct DateTime dat;
-		TEXT date[LEN_DATSTRING],time[LEN_DATSTRING];
+		TEXT date[2 * LEN_DATSTRING],time[2 * LEN_DATSTRING];
 
 		memset(&dat,0,sizeof(dat));
 
@@ -8240,7 +8921,7 @@ Action_SetDate(
 		memset(time,0,sizeof(time));
 
 		dat.dat_Stamp	= (*ds);
-		dat.dat_Format	= FORMAT_DEF;
+		dat.dat_Format	= FORMAT_DOS;
 		dat.dat_StrDate	= date;
 		dat.dat_StrTime	= time;
 
@@ -8252,16 +8933,28 @@ Action_SetDate(
 		{
 			D(("could not convert days=%ld/minutes=%ld/ticks=%ld", ds->ds_Days, ds->ds_Minute, ds->ds_Tick));
 		}
+
+		ASSERT( strlen(date) < sizeof(date) );
+		ASSERT( strlen(time) < sizeof(time) );
 	}
 	#endif /* DEBUG */
 
 	seconds = (ds->ds_Days * 24 * 60 + ds->ds_Minute) * 60 + (ds->ds_Tick / TICKS_PER_SECOND);
 
-	st.ctime = 0;
+	/* We change both the creation date/time and the last modification
+	 * date/time because the SMB server may not initialize all four
+	 * date/time records for ACTION_EXAMINE/ACTION_EXNEXT/ACTION_EXAMINE_ALL
+	 * to use. The modification date/time may be missing, so the
+	 * creation date/time is used in its stead.
+	 *
+	 * Unless we initialize it here, the ACTION_EXAMINE/ACTION_EXNEXT/ACTION_EXAMINE_ALL
+	 * 'Date file last changed' may always end up using the creation time.
+	 */
+	st.ctime = seconds + UNIX_TIME_OFFSET + get_time_zone_delta();
+	st.mtime = st.ctime;
 	st.atime = 0;
-	st.mtime = seconds + UNIX_TIME_OFFSET + get_time_zone_delta();
 
-	D(("mtime = %lu",st.mtime));
+	D(("ctime = mtime = %lu",st.ctime));
 
 	if(smba_setattr(file,&st,NULL,&error) < 0)
 	{
@@ -8415,7 +9108,7 @@ Action_ExamineFH(
 	#if DEBUG
 	{
 		struct DateTime dat;
-		TEXT date[LEN_DATSTRING],time[LEN_DATSTRING];
+		TEXT date[2 * LEN_DATSTRING],time[2 * LEN_DATSTRING];
 
 		memset(&dat,0,sizeof(dat));
 
@@ -8423,7 +9116,7 @@ Action_ExamineFH(
 		memset(time,0,sizeof(time));
 
 		dat.dat_Stamp	= fib->fib_Date;
-		dat.dat_Format	= FORMAT_DEF;
+		dat.dat_Format	= FORMAT_DOS;
 		dat.dat_StrDate	= date;
 		dat.dat_StrTime	= time;
 
@@ -8435,6 +9128,9 @@ Action_ExamineFH(
 		{
 			D(("could not convert days=%ld/minutes=%ld/ticks=%ld", fib->fib_Date.ds_Days, fib->fib_Date.ds_Minute, fib->fib_Date.ds_Tick));
 		}
+
+		ASSERT( strlen(date) < sizeof(date) );
+		ASSERT( strlen(time) < sizeof(time) );
 	}
 	#endif /* DEBUG */
 
@@ -8494,7 +9190,8 @@ Action_ParentFH(
 		goto out;
 	}
 
-	AddTail((struct List *)&LockList,(struct Node *)ln);
+	add_lock_node(ln);
+
 	result = MKBADDR(&ln->ln_FileLock);
 	SHOWVALUE(&ln->ln_FileLock);
 
@@ -8567,7 +9264,8 @@ Action_CopyDirFH(
 		goto out;
 	}
 
-	AddTail((struct List *)&LockList,(struct Node *)ln);
+	add_lock_node(ln);
+
 	result = MKBADDR(&ln->ln_FileLock);
 	SHOWVALUE(&ln->ln_FileLock);
 
@@ -8632,17 +9330,18 @@ Action_FHFromLock(
 		goto out;
 	}
 
-	/* The file handle absorbs the lock. */
-	ln->ln_FullName = NULL;
-	ln->ln_File = NULL;
-	ln->ln_Magic = 0;
+	/* The file handle absorbs the lock, which in this case includes
+	 * the full path name and the SMB file.
+	 */
+	remove_lock_node(ln);
 
-	Remove((struct Node *)ln);
+	ln->ln_FullName = NULL;
 	free_memory(ln);
 
 	fh->fh_Arg1 = (LONG)fn;
 
-	AddTail((struct List *)&FileList,(struct Node *)fn);
+	add_file_node(fn);
+
 	result = DOSTRUE;
 	error = OK;
 
@@ -8756,7 +9455,7 @@ Action_CurrentVolume(
 
 	D(("file opened on '%s'", escape_name(fn->fn_FullName)));
 
-	if(NOT DeviceNodeAdded)
+	if(NOT VolumeNodeAdded)
 	{
 		error = ERROR_ACTION_NOT_KNOWN;
 		goto out;
@@ -8766,7 +9465,7 @@ Action_CurrentVolume(
 	 * requester. Not that it should be needed, but you never know...
 	 */
 
-	result	= MKBADDR(DeviceNode);
+	result	= MKBADDR(VolumeNode);
 	error	= 0; /* This is actually the unit number. */
 
  out:
@@ -9052,6 +9751,14 @@ Action_SetComment(
 
 	name_len = convert_from_bcpl_to_c_string(name,sizeof(name),bcpl_name);
 
+	if(path_name_is_invalid(name, name_len))
+	{
+		D(("'%s' is not a valid path name", name));
+
+		error = ERROR_OBJECT_NOT_FOUND;
+		goto out;
+	}
+
 	if(NOT ServerData->server.unicode_enabled)
 	{
 		error = translate_amiga_name_to_smb_name(name,name_len,sizeof(name));
@@ -9147,12 +9854,18 @@ Action_LockRecord(
 	if((mode == REC_SHARED_IMMED) || (mode == REC_EXCLUSIVE_IMMED))
 		timeout = 0;
 
+	/* If a timeout was given, it must be converted from ticks
+	 * per second into milliseconds.
+	 */
 	if(timeout > 0)
 	{
-		if(timeout > 214748364)
+		/* Is the timeout too large to be converted into
+		 * milliseconds?
+		 */
+		if(timeout > 0xFFFFFFFFUL / TICKS_PER_SECOND)
 			timeout = ~0UL;	/* wait forever */
 		else
-			timeout *= 20;	/* milliseconds instead of Ticks */
+			timeout *= 1000 / TICKS_PER_SECOND;
 	}
 
 	if(smba_lockrec (fn->fn_File, offset, length, umode, 0, (long)timeout, &error) < 0)
@@ -9350,6 +10063,9 @@ file_system_handler(
 			LONG which;
 			LONG i;
 
+			/* Figure out which CLI process number
+			 * this command is associated with.
+			 */
 			Forbid();
 
 			which = max_cli = MaxCli();
@@ -10158,6 +10874,8 @@ convert_quad_to_string(const QUAD * const number)
 		if(m.High == 0 && m.Low == 0)
 			break;
 	}
+
+	ASSERT( len+1 >= 0 );
 
 	return(&string[len+1]);
 }

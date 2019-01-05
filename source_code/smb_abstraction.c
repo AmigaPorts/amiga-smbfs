@@ -38,6 +38,47 @@ static int smba_setup_dircache (struct smba_server * server,int cache_size, int 
 
 /*****************************************************************************/
 
+#ifdef USE_SPLAY_TREE
+
+/* This is used by the splay tree functions to compare individual
+ * key values. These key values are smba_file_t addresses.
+ */
+static int
+compare_files_by_address(const BYTE * a, const BYTE * b)
+{
+	int result;
+
+	if (a < b)
+		result = -1;
+	else if (a == b)
+		result = 0;
+	else
+		result = 1;
+
+	return(result);
+}
+
+#endif /* USE_SPLAY_TREE */
+
+/*****************************************************************************/
+
+static void
+init_open_file_list(smba_server_t *res)
+{
+	NewList((struct List *)&res->open_files);
+
+	#ifdef USE_SPLAY_TREE
+	{
+		splay_tree_init(&res->open_file_address_tree, (splay_key_compare_t)compare_files_by_address);
+
+		splay_tree_init(&res->open_file_name_tree, (splay_key_compare_t)compare_names);
+		res->open_file_name_tree.st_allow_duplicates = TRUE;
+	}
+	#endif /* USE_SPLAY_TREE */
+}
+
+/*****************************************************************************/
+
 static int
 smba_connect (
 	smba_connect_parameters_t *	connect_parameters,
@@ -54,6 +95,12 @@ smba_connect (
 	int							opt_case_sensitive,
 	int							opt_session_setup_delay_unicode,
 	int							opt_write_behind,
+	int							opt_smb_request_write_threshold,
+	int							opt_smb_request_read_threshold,
+	int							opt_scatter_gather,
+	int							opt_tcp_no_delay,
+	int							opt_socket_receive_buffer_size,
+	int							opt_socket_send_buffer_size,
 	int *						error_ptr,
 	int *						smb_error_class_ptr,
 	int *						smb_error_ptr,
@@ -111,6 +158,38 @@ smba_connect (
 
 	LOG(("delay use of unicode during session setup = %s\n",opt_session_setup_delay_unicode ? "yes" : "no"));
 
+	/* Do not send SMB header and payload for write operations separately,
+	 * but in a single chunk if their combined size is smaller than
+	 * or equal to this threshold value.
+	 */
+	res->server.smb_write_threshold = opt_smb_request_write_threshold;
+
+	LOG(("SMB write request threshold size = %ld bytes\n", res->server.smb_write_threshold));
+
+	/* Do not receive SMB header and payload for read operations separately,
+	 * but in a single chunk if their combined size is smaller than
+	 * or equal to this threshold value.
+	 */
+	res->server.smb_read_threshold = opt_smb_request_read_threshold;
+
+	LOG(("SMB read request threshold size = %ld bytes\n", res->server.smb_read_threshold));
+
+	/* Use sendmsg() instead of send() where useful? */
+	res->server.scatter_gather = opt_scatter_gather;
+
+	LOG(("use sendmsg() instead of send() where useful = %s\n",opt_scatter_gather ? "yes" : "no"));
+
+	/* Disable the Nagle algorithm, causing send() to immediately
+	 * result in the data being transmitted?
+	 */
+	res->server.tcp_no_delay = opt_tcp_no_delay;
+
+	/* Try to get the TCP/IP stack to use a specific
+	 * receive/transmit buffer size?
+	 */
+	res->server.socket_receive_buffer_size = opt_socket_receive_buffer_size;
+	res->server.socket_send_buffer_size = opt_socket_send_buffer_size;
+
 	/* Enable asynchronous SMB_COM_WRITE_RAW operations? */
 	res->server.write_behind = opt_write_behind;
 
@@ -157,6 +236,8 @@ smba_connect (
 		if(servent != NULL)
 		{
 			data.addr.sin_port = servent->s_port;
+
+			LOG(("using port number %ld\n",ntohs(data.addr.sin_port)));
 		}
 		else
 		{
@@ -168,9 +249,21 @@ smba_connect (
 			 * valid for a TCP service.
 			 */
 			n = strtol(tcp_service_name,&str,10);
-			if(str != tcp_service_name && (*str) == '\0' && 0 < n && n < 65536)
+			if(str != tcp_service_name && (*str) == '\0')
 			{
-				data.addr.sin_port = htons (n);
+				if(0 < n && n < 65536)
+				{
+					data.addr.sin_port = htons (n);
+
+					LOG(("using port number %ld\n",n));
+				}
+				else
+				{
+					report_error("Port number '%s' is out of range.", tcp_service_name);
+
+					(*error_ptr) = EINVAL;
+					goto error_occured;
+				}
 			}
 			else
 			{
@@ -183,19 +276,31 @@ smba_connect (
 	}
 	else if (res->server.raw_smb)
 	{
+		int port;
+
 		servent = getservbyname("microsoft-ds","tcp");
 		if(servent != NULL)
-			data.addr.sin_port = servent->s_port;
+			port = servent->s_port;
 		else
-			data.addr.sin_port = htons (445);
+			port = htons (445);
+
+		LOG(("using port number %ld\n",ntohs(port)));
+
+		data.addr.sin_port = port;
 	}
 	else
 	{
+		int port;
+
 		servent = getservbyname("netbios-ssn","tcp");
 		if(servent != NULL)
-			data.addr.sin_port = servent->s_port;
+			port = servent->s_port;
 		else
-			data.addr.sin_port = htons (139);
+			port = htons (139);
+
+		LOG(("using port number %ld\n",ntohs(port)));
+
+		data.addr.sin_port = port;
 	}
 
 	data.fd = socket (AF_INET, SOCK_STREAM, 0);
@@ -232,7 +337,7 @@ smba_connect (
 	{
 		if (!res->server.raw_smb && strlen (connect_parameters->server_ipname) > 16)
 		{
-			report_error("Server name '%s' is too long for NetBIOS (max %ld characters).",connect_parameters->server_ipname,16);
+			report_error("Server name '%s' is too long for NetBIOS (%ld characters are possible).",connect_parameters->server_ipname,16);
 
 			(*error_ptr) = ENAMETOOLONG;
 			goto error_occured;
@@ -247,7 +352,7 @@ smba_connect (
 	{
 		if (!res->server.raw_smb && strlen (hostname) > 16)
 		{
-			report_error("Local host name '%s' is too long for NetBIOS (max %ld characters).", hostname, 16);
+			report_error("Local host name '%s' is too long for NetBIOS (%ld characters are possible).", hostname, 16);
 
 			(*error_ptr) = ENAMETOOLONG;
 			goto error_occured;
@@ -259,7 +364,7 @@ smba_connect (
 
 	res->server.mount_data = data;
 
-	NewList((struct List *)&res->open_files);
+	init_open_file_list(res);
 
 	if (smb_proc_connect (&res->server, error_ptr) < 0)
 		goto error_occured;
@@ -316,9 +421,17 @@ make_open (smba_file_t * f, int need_fid, int writable, int truncate_file, int *
 		if (!f->is_valid || f->attr_time == 0 || (now > f->attr_time && now - f->attr_time > ATTR_CACHE_TIME))
 		{
 			if (!f->server->server.prefer_core_protocol && f->server->server.protocol >= PROTOCOL_LANMAN2)
+			{
+				SHOWMSG("using the LAN Manager 2.0 getattr() variant");
+
 				result = smb_query_path_information (&s->server, f->dirent.complete_path, f->dirent.len, 0, &f->dirent, error_ptr);
+			}
 			else
+			{
+				SHOWMSG("using the legacy getattr() variant");
+
 				result = smb_proc_getattr_core (&s->server, f->dirent.complete_path, f->dirent.len, &f->dirent, error_ptr);
+			}
 
 			if (result < 0)
 				goto out;
@@ -333,6 +446,8 @@ make_open (smba_file_t * f, int need_fid, int writable, int truncate_file, int *
 					if(!f->dirent.opened)
 					{
 						LOG (("opening file '%s'\n", escape_name(f->dirent.complete_path)));
+
+						SHOWMSG("using the LAN Manager 2.0 open() variant");
 
 						result = smb_proc_open (&s->server, f->dirent.complete_path, f->dirent.len, writable, truncate_file, &f->dirent, error_ptr);
 						if (result < 0)
@@ -349,6 +464,8 @@ make_open (smba_file_t * f, int need_fid, int writable, int truncate_file, int *
 				if(!f->dirent.opened)
 				{
 					LOG (("opening file '%s'\n", escape_name(f->dirent.complete_path)));
+
+					SHOWMSG("using the legacy open() variant");
 
 					result = smb_proc_open (&s->server, f->dirent.complete_path, f->dirent.len, writable, truncate_file, &f->dirent, error_ptr);
 					if (result < 0)
@@ -401,8 +518,49 @@ make_open (smba_file_t * f, int need_fid, int writable, int truncate_file, int *
 
 /*****************************************************************************/
 
+static void
+add_smba_file(smba_server_t * s, smba_file_t *f)
+{
+	AddTail ((struct List *)&s->open_files, (struct Node *)f);
+
+	#ifdef USE_SPLAY_TREE
+	{
+		f->splay_address_node.sn_key = f;
+		f->splay_address_node.sn_userdata = f;
+		splay_tree_add(&s->open_file_address_tree, &f->splay_address_node);
+
+		f->splay_name_node.sn_key = f->dirent.complete_path;
+		f->splay_name_node.sn_userdata = f;
+		splay_tree_add(&s->open_file_name_tree, &f->splay_name_node);
+	}
+	#endif /* USE_SPLAY_TREE */
+}
+
+/*****************************************************************************/
+
+static void
+remove_smba_file(smba_server_t * s, smba_file_t *f)
+{
+	Remove((struct Node *)f);
+
+	#ifdef USE_SPLAY_TREE
+	{
+		splay_tree_remove(&s->open_file_address_tree, NULL, (splay_key_t)f);
+		splay_tree_remove(&s->open_file_name_tree, &f->splay_name_node, f->splay_name_node.sn_key);
+	}
+	#endif /* USE_SPLAY_TREE */
+}
+
+/*****************************************************************************/
+
 int
-smba_open (smba_server_t * s, const char *name, int writable, int truncate_file, smba_file_t ** file, int * error_ptr)
+smba_open (
+	smba_server_t * s,
+	const char *name,
+	int writable,
+	int truncate_file,
+	smba_file_t ** file,
+	int * error_ptr)
 {
 	smba_file_t *f;
 	int result;
@@ -418,7 +576,7 @@ smba_open (smba_server_t * s, const char *name, int writable, int truncate_file,
 		goto out;
 	}
 
-	memset(f,0,sizeof(*f));
+	memset(f, 0, sizeof(*f));
 
 	f->dirent.complete_path = (char *)name;
 	f->dirent.len = strlen (name);
@@ -433,7 +591,7 @@ smba_open (smba_server_t * s, const char *name, int writable, int truncate_file,
 		goto out;
 	}
 
-	AddTail ((struct List *)&s->open_files, (struct Node *)f);
+	add_smba_file(s, f);
 	s->num_open_files++;
 
 	LOG(("file has been 'opened', number of open files = %ld\n",s->num_open_files));
@@ -464,17 +622,23 @@ write_attr (smba_file_t * f, int * error_ptr)
 	{
 		/* Copy these, because make_open() may overwrite them. */
 		time_t mtime = f->dirent.mtime;
+		time_t ctime = f->dirent.ctime;
 		dword attr = f->dirent.attr;
 
 		LOG(("mtime = %lu\n",f->dirent.mtime));
+		LOG(("ctime = %lu\n",f->dirent.ctime));
+
+		SHOWMSG("using the LAN Manager 2.0 open() variant");
 
 		result = make_open (f, open_need_fid, open_writable, open_dont_truncate, error_ptr);
 		if (result < 0)
 			goto out;
 
 		LOG(("mtime = %lu\n",f->dirent.mtime));
+		LOG(("ctime = %lu\n",f->dirent.ctime));
 
 		f->dirent.mtime = mtime;
+		f->dirent.ctime = ctime;
 		f->dirent.attr = attr;
 
 		result = smb_set_file_information (&f->server->server, &f->dirent, NULL, error_ptr);
@@ -487,20 +651,26 @@ write_attr (smba_file_t * f, int * error_ptr)
 	{
 		/* Copy these, because make_open() may overwrite them. */
 		time_t mtime = f->dirent.mtime;
+		time_t ctime = f->dirent.ctime;
 		dword attr = f->dirent.attr;
 
 		LOG(("mtime = %lu\n",f->dirent.mtime));
+		LOG(("ctime = %lu\n",f->dirent.ctime));
+
+		SHOWMSG("using the legacy open() variant");
 
 		result = make_open (f, open_dont_need_fid, open_writable, open_dont_truncate, error_ptr);
 		if (result < 0)
 			goto out;
 
 		LOG(("mtime = %lu\n",f->dirent.mtime));
+		LOG(("ctime = %lu\n",f->dirent.ctime));
 
 		f->dirent.mtime = mtime;
+		f->dirent.ctime = ctime;
 		f->dirent.attr = attr;
 
-		/* If the attributes need to be updated, we cannot used smb_proc_setattrE(),
+		/* If the attributes need to be updated, we cannot use smb_proc_setattrE(),
 		 * because that only updates the "time of last write access", but not the
 		 * attributes.
 		 */
@@ -541,54 +711,71 @@ write_attr (smba_file_t * f, int * error_ptr)
 
 /*****************************************************************************/
 
+static int
+file_is_valid(smba_server_t * s, const smba_file_t * f)
+{
+	int is_valid;
+
+	#ifndef USE_SPLAY_TREE
+	{
+		const smba_file_t * file;
+
+		is_valid = FALSE;
+
+		for (file = (smba_file_t *)s->open_files.mlh_Head ;
+			file->node.mln_Succ != NULL ;
+			file = (smba_file_t *)file->node.mln_Succ)
+		{
+			if (file == f)
+			{
+				is_valid = TRUE;
+				break;
+			}
+		}
+	}
+	#else
+	{
+		is_valid = (splay_tree_find(&s->open_file_address_tree, (splay_key_t)f) != NULL);
+	}
+	#endif /* USE_SPLAY_TREE */
+
+	return(is_valid);
+}
+
+/*****************************************************************************/
+
 void
 smba_close (smba_server_t * s, smba_file_t * f)
 {
-	smba_file_t * found;
-	smba_file_t * file;
-
-	found = NULL;
-
-	for(file = (smba_file_t *)s->open_files.mlh_Head ;
-	    file->node.mln_Succ != NULL ;
-	    file = (smba_file_t *)file->node.mln_Succ)
-	{
-		if(file == f)
-		{
-			found = f;
-			break;
-		}
-	}
-
-	if(found != NULL)
+	if (file_is_valid(s, f))
 	{
 		int ignored_error;
 
-		Remove((struct Node *)found);
+		remove_smba_file(s, f);
 
-		if(found->attr_dirty)
-			write_attr(found, &ignored_error);
+		if(f->attr_dirty)
+			write_attr(f, &ignored_error);
 
-		if (found->dirent.opened)
+		if (f->dirent.opened)
 		{
-			LOG (("closing file '%s' (fileid=0x%04lx)\n", escape_name(found->dirent.complete_path), found->dirent.fileid));
+			LOG (("closing file '%s' (fileid=0x%04lx)\n", escape_name(f->dirent.complete_path), f->dirent.fileid));
 
 			/* Don't change the modification time. */
-			smb_proc_close (&found->server->server, found->dirent.fileid, -1, &ignored_error);
+			smb_proc_close (&f->server->server, f->dirent.fileid, -1, &ignored_error);
 		}
 
-		if (found->dircache != NULL)
+		if (f->dircache != NULL)
 		{
-			found->dircache->cache_for = NULL;
-			found->dircache->len = 0;
-			found->dircache = NULL;
+			f->dircache->cache_for = NULL;
+			f->dircache->len = 0;
+			f->dircache = NULL;
 		}
 
-		found->server->num_open_files--;
+		f->server->num_open_files--;
 
-		LOG(("file closed, number of open files = %ld\n",found->server->num_open_files));
+		LOG(("file closed, number of open files = %ld\n",f->server->num_open_files));
 
-		free (found);
+		free (f);
 	}
 	else
 	{
@@ -1042,6 +1229,8 @@ smba_lockrec (smba_file_t *f, long offset, long len, long mode, int unlocked, lo
 		goto out;
 	}
 
+	memset(rec_lock, 0, sizeof(*rec_lock));
+
 	rec_lock->offset = offset,
 	rec_lock->len = len;
 
@@ -1076,7 +1265,7 @@ smba_getattr (smba_file_t * f, smba_stat_t * data, int * error_ptr)
 
 		if (!f->server->server.prefer_core_protocol && f->server->server.protocol >= PROTOCOL_LANMAN2)
 		{
-			LOG(("using smb_query_path_information\n"));
+			SHOWMSG("using the LAN Manager 2.0 path query variant");
 
 			if (f->dirent.opened)
 				result = smb_query_path_information (&f->server->server, NULL, 0, f->dirent.fileid, &f->dirent, error_ptr);
@@ -1085,6 +1274,8 @@ smba_getattr (smba_file_t * f, smba_stat_t * data, int * error_ptr)
 		}
 		else
 		{
+			SHOWMSG("using the legacy path query variant");
+
 			if (f->dirent.opened && f->server->supports_E)
 			{
 				LOG(("using smb_proc_getattrE\n"));
@@ -1193,9 +1384,17 @@ smba_setattr (smba_file_t * f, const smba_stat_t * st, const QUAD * const size, 
 			goto out;
 
 		if(!f->server->server.prefer_core_protocol && f->server->server.protocol >= PROTOCOL_LANMAN2)
+		{
+			SHOWMSG("using the LAN Manager 2.0 trunc variant");
+
 			result = smb_set_file_information (&f->server->server, &f->dirent, size, error_ptr);
+		}
 		else
+		{
+			SHOWMSG("using the legacy trunc variant (which cannot truncate files)");
+
 			result = smb_proc_trunc (&f->server->server, &f->dirent, size->Low, error_ptr);
+		}
 
 		if(result < 0)
 			goto out;
@@ -1265,7 +1464,8 @@ smba_readdir (smba_file_t * f, int offs, void *callback_data, smba_callback_t ca
 			f->dircache->len = 0;
 			f->dircache->base = cache_index;
 
-			num_entries = smb_proc_readdir (&f->server->server, f->dirent.complete_path, cache_index, f->dircache->cache_size, f->dircache->cache, error_ptr);
+			num_entries = smb_proc_readdir (&f->server->server, f->dirent.complete_path, cache_index, f->dircache->cache_size,
+				f->dircache->cache, error_ptr);
 
 			/* We stop on error, or if the directory is empty. */
 			if (num_entries <= 0)
@@ -1351,13 +1551,39 @@ invalidate_dircache (struct smba_server * server)
 
 /*****************************************************************************/
 
+static char *
+allocate_path_name(const smba_file_t * dir, const char *name, size_t * path_name_len_ptr)
+{
+	size_t dir_len = dir->dirent.len;
+	char * path;
+	size_t len;
+
+	len = strlen(name);
+
+	path = malloc (dir_len + 1 + len + 1);
+	if(path != NULL)
+	{
+		memcpy (path, dir->dirent.complete_path, dir_len);
+		path[dir_len++] = DOS_PATHSEP;
+		memcpy(&path[dir_len], name, len+1); /* length includes terminating NUL character */
+
+		ASSERT( path_name_len_ptr != NULL );
+
+		(*path_name_len_ptr) = dir_len + len;
+	}
+
+	return(path);
+}
+
+/*****************************************************************************/
+
 int
 smba_create (smba_file_t * dir, const char *name, int truncate, int * error_ptr)
 {
 	struct smb_dirent entry;
 	int ignored_error;
 	char *path = NULL;
-	size_t len;
+	size_t path_len = 0;
 	int result;
 
 	result = make_open (dir, open_dont_need_fid, open_read_only, open_dont_truncate, error_ptr);
@@ -1368,9 +1594,7 @@ smba_create (smba_file_t * dir, const char *name, int truncate, int * error_ptr)
 
 	entry.atime = entry.mtime = entry.ctime = get_current_time();
 
-	len = strlen(name);
-
-	path = malloc (len + 1 + dir->dirent.len + 1);
+	path = allocate_path_name(dir, name, &path_len);
 	if(path == NULL)
 	{
 		(*error_ptr) = ENOMEM;
@@ -1379,19 +1603,19 @@ smba_create (smba_file_t * dir, const char *name, int truncate, int * error_ptr)
 		goto out;
 	}
 
-	memcpy (path, dir->dirent.complete_path, dir->dirent.len);
-	path[dir->dirent.len] = DOS_PATHSEP;
-	memcpy(&path[dir->dirent.len+1], name, len+1); /* Length includes terminating NUL byte. */
-
 	if (!dir->server->server.prefer_core_protocol && dir->server->server.protocol >= PROTOCOL_LANMAN2)
 	{
-		result = smb_proc_open (&dir->server->server, path, strlen(path), open_writable, truncate, &entry, error_ptr);
+		SHOWMSG("using the LAN Manager 2.0 creat variant");
+
+		result = smb_proc_open (&dir->server->server, path, path_len, open_writable, truncate, &entry, error_ptr);
 		if(result < 0)
 			goto out;
 	}
 	else
 	{
-		result = smb_proc_create (&dir->server->server, path, strlen (path), &entry, error_ptr);
+		SHOWMSG("using the legacy creat variant");
+
+		result = smb_proc_create (&dir->server->server, path, path_len, &entry, error_ptr);
 		if(result < 0)
 			goto out;
 	}
@@ -1415,18 +1639,14 @@ int
 smba_mkdir (smba_file_t * dir, const char *name, int * error_ptr)
 {
 	char *path = NULL;
-	int path_len;
-	int name_len;
+	size_t path_len = 0;
 	int result;
 
 	result = make_open (dir, open_dont_need_fid, open_read_only, open_dont_truncate, error_ptr);
 	if (result < 0)
 		goto out;
 
-	name_len = strlen (name);
-	path_len = dir->dirent.len + 1 + name_len;
-
-	path = malloc (path_len + 1);
+	path = allocate_path_name(dir, name, &path_len);
 	if(path == NULL)
 	{
 		(*error_ptr) = ENOMEM;
@@ -1434,11 +1654,6 @@ smba_mkdir (smba_file_t * dir, const char *name, int * error_ptr)
 		result = -1;
 		goto out;
 	}
-
-	memcpy (path, dir->dirent.complete_path, dir->dirent.len);
-	path[dir->dirent.len] = DOS_PATHSEP;
-	memcpy (&path[dir->dirent.len + 1], name, name_len);
-	path[path_len] = '\0';
 
 	result = smb_proc_mkdir (&dir->server->server, path, path_len, error_ptr);
 	if(result < 0)
@@ -1454,34 +1669,81 @@ smba_mkdir (smba_file_t * dir, const char *name, int * error_ptr)
 
 /*****************************************************************************/
 
+/* Mark a file/directory as no longer valid, closing it if necessary. */
+static int
+invalidate_smba_file(smba_server_t * s, smba_file_t *f, const char *path, int * error_ptr)
+{
+	int result = 0;
+
+	if (f->dirent.opened)
+	{
+		/* Don't change the modification time. */
+		result = smb_proc_close (&s->server, f->dirent.fileid, -1, error_ptr);
+		if(result < 0)
+		{
+			LOG(("closing '%s' with file id %ld failed\n", escape_name(path), f->dirent.fileid));
+			goto out;
+		}
+
+		f->dirent.opened = FALSE;
+	}
+
+	f->is_valid = FALSE;
+
+ out:
+
+	return(result);
+}
+
+/*****************************************************************************/
+
 static int
 close_path (smba_server_t * s, const char *path, int * error_ptr)
 {
 	int result = 0;
 	smba_file_t *p;
 
-	for (p = (smba_file_t *)s->open_files.mlh_Head;
-	     p->node.mln_Succ != NULL;
-	     p = (smba_file_t *)p->node.mln_Succ)
+	#ifndef USE_SPLAY_TREE
 	{
-		if (p->is_valid && compare_names(p->dirent.complete_path, path) == SAME)
+		for (p = (smba_file_t *)s->open_files.mlh_Head;
+			p->node.mln_Succ != NULL;
+			p = (smba_file_t *)p->node.mln_Succ)
 		{
-			if (p->dirent.opened)
+			if (p->is_valid && compare_names(p->dirent.complete_path, path) == SAME)
 			{
-				/* Don't change the modification time. */
-				result = smb_proc_close (&s->server, p->dirent.fileid, -1, error_ptr);
+				result = invalidate_smba_file(s, p, path, error_ptr);
 				if(result < 0)
-				{
-					LOG(("closing '%s' with file id %ld failed\n", escape_name(path), p->dirent.fileid));
 					break;
-				}
-
-				p->dirent.opened = FALSE;
 			}
-
-			p->is_valid = FALSE;
 		}
 	}
+	#else
+	{
+		struct splay_node * sn;
+
+		/* Find all files which match the same path name. */
+		sn = splay_tree_find(&s->open_file_name_tree, (splay_key_t)path);
+		if(sn != NULL)
+		{
+			/* Walk through all the files, marking them as no longer
+			* valid and closing them, if necessary. Note that we
+			* do not remove them from the list of open files, we just
+			* mark them for reopening later, if needed.
+			*/
+			for((void)NULL ; sn != NULL ; sn = sn->sn_next)
+			{
+				p = sn->sn_userdata;
+
+				if (p->is_valid)
+				{
+					result = invalidate_smba_file(s, p, path, error_ptr);
+					if(result < 0)
+						break;
+				}
+			}
+		}
+	}
+	#endif /* USE_SPLAY_TREE */
 
 	return(result);
 }
@@ -1633,7 +1895,7 @@ smba_setup_dircache (struct smba_server * server,int cache_size, int * error_ptr
 		goto out;
 	}
 
-	memset(the_dircache,0,sizeof(*the_dircache));
+	memset(the_dircache, 0, sizeof(*the_dircache));
 	the_dircache->cache_size = cache_size;
 
 	for (i = 0; i < the_dircache->cache_size; i++)
@@ -1677,9 +1939,27 @@ extract_service (
 	char * share_start;
 	char * root_start;
 	char * complete_service;
-	char * service_copy;
+	char * service_copy = NULL;
 	char * service_name;
 	int result = -1;
+
+	if (strlen (service) < 4)
+	{
+		report_error("Service name '%s' is too short.",service);
+
+		(*error_ptr) = EINVAL;
+
+		goto out;
+	}
+
+	if (service[0] != '/')
+	{
+		report_error("Service name '%s' must begin with '/'.",service);
+
+		(*error_ptr) = EINVAL;
+
+		goto out;
+	}
 
 	service_copy = malloc(strlen(service)+1);
 	if(service_copy == NULL)
@@ -1692,28 +1972,11 @@ extract_service (
 	}
 
 	strcpy (service_copy, service);
+
 	complete_service = service_copy;
 
-	if (strlen (complete_service) < 4)
-	{
-		report_error("Service name '%s' is too short.",complete_service);
-
-		(*error_ptr) = EINVAL;
-
-		goto out;
-	}
-
-	if (complete_service[0] != '/')
-	{
-		report_error("Service name '%s' must begin with '/'.",complete_service);
-
-		(*error_ptr) = EINVAL;
-
-		goto out;
-	}
-
 	while (complete_service[0] == '/')
-		complete_service += 1;
+		complete_service++;
 
 	share_start = strchr (complete_service, '/');
 	if (share_start == NULL)
@@ -1751,20 +2014,29 @@ extract_service (
 			len--;
 
 		service_name[len] = '\0';
+
+		if(len > tcp_service_name_size)
+		{
+			report_error("TCP service name/port number is too long in '%s' (%ld characters are possible).",service_name,tcp_service_name_size);
+
+			(*error_ptr) = EINVAL;
+
+			goto out;
+		}
 	}
 
-	if (strlen (complete_service) > 63)
+	if (strlen (complete_service) > server_size)
 	{
-		report_error("Server name is too long in '%s' (max %ld characters).",service,63);
+		report_error("Server name is too long in '%s' (%ld characters are possible).",service,server_size);
 
 		(*error_ptr) = ENAMETOOLONG;
 
 		goto out;
 	}
 
-	if (strlen (share_start) > 255)
+	if (strlen (share_start) > share_size)
 	{
-		report_error("Share name is too long in '%s' (max %ld characters).",service,255);
+		report_error("Share name is too long in '%s' (%ld characters are possible).",service,share_size);
 
 		(*error_ptr) = ENAMETOOLONG;
 
@@ -1802,9 +2074,17 @@ smba_start(
 	int					opt_case_sensitive,
 	int					opt_session_setup_delay_unicode,
 	int					opt_write_behind,
+	int					opt_smb_request_write_threshold,
+	int					opt_smb_request_read_threshold,
+	int					opt_scatter_gather,
+	int					opt_tcp_no_delay,
+	int					opt_socket_receive_buffer_size,
+	int					opt_socket_send_buffer_size,
 	int *				error_ptr,
 	int *				smb_error_class_ptr,
 	int *				smb_error_ptr,
+	smba_connect_parameters_t *
+						smba_connect_par,
 	smba_server_t **	smba_server_ptr)
 {
 	smba_connect_parameters_t par;
@@ -1962,7 +2242,7 @@ smba_start(
 			/* Make sure the hostname is 16 characters or less (for NetBIOS) */
 			if (!opt_raw_smb && strlen (host_name) > 16)
 			{
-				report_error("Server name '%s' is too long (max %ld characters).", host_name, 16);
+				report_error("Server name '%s' is too long (%ld characters are possible).", host_name, 16);
 
 				(*error_ptr) = ENAMETOOLONG;
 				goto out;
@@ -1976,7 +2256,7 @@ smba_start(
 	{
 		if(strlen(opt_password) >= sizeof(password))
 		{
-			report_error("Password is too long (max %ld characters).", sizeof(password)-1);
+			report_error("Password is too long (%ld characters are possible).", sizeof(password)-1);
 
 			(*error_ptr) = ENAMETOOLONG;
 			goto out;
@@ -1987,7 +2267,7 @@ smba_start(
 
 	if(strlen(opt_username) >= sizeof(username))
 	{
-		report_error("User name '%s' is too long (max %ld characters).", username,sizeof(username)-1);
+		report_error("User name '%s' is too long (%ld characters are possible).", username,sizeof(username)-1);
 
 		(*error_ptr) = ENAMETOOLONG;
 		goto out;
@@ -1999,7 +2279,7 @@ smba_start(
 	{
 		if (!opt_raw_smb && strlen (opt_servername) > 16)
 		{
-			report_error("Server name '%s' is too long (max %ld characters).", opt_servername,16);
+			report_error("Server name '%s' is too long (%ld characters are possible).", opt_servername,16);
 
 			(*error_ptr) = ENAMETOOLONG;
 			goto out;
@@ -2012,7 +2292,7 @@ smba_start(
 	{
 		if (!opt_raw_smb && strlen (opt_clientname) > 16)
 		{
-			report_error("Client name '%s' is too long (max %ld characters).", opt_clientname,16);
+			report_error("Client name '%s' is too long (%ld characters are possible).", opt_clientname,16);
 
 			(*error_ptr) = ENAMETOOLONG;
 			goto out;
@@ -2034,7 +2314,8 @@ smba_start(
 	par.username = username;
 	par.password = password;
 
-	LOG(("server name = '%s', client name = '%s', workgroup name = '%s', user name = '%s'\n", server_name, client_name, workgroup, username));
+	LOG(("server name = '%s', client name = '%s', workgroup name = '%s', user name = '%s'\n",
+		server_name, client_name, workgroup, username));
 
 	if(smba_connect (
 		&par,
@@ -2051,6 +2332,12 @@ smba_start(
 		opt_case_sensitive,
 		opt_session_setup_delay_unicode,
 		opt_write_behind,
+		opt_smb_request_write_threshold,
+		opt_smb_request_read_threshold,
+		opt_scatter_gather,
+		opt_tcp_no_delay,
+		opt_socket_receive_buffer_size,
+		opt_socket_send_buffer_size,
 		error_ptr,
 		smb_error_class_ptr,
 		smb_error_ptr,
@@ -2063,15 +2350,20 @@ smba_start(
 
 			smb_translate_error_class_and_code((*smb_error_class_ptr),(*smb_error_ptr),&smb_class_name,&smb_code_text);
 
-			report_error("Could not connect to server '%s' (%ld/%ld, %s/%s).",server,(*smb_error_class_ptr),(*smb_error_ptr),smb_class_name,smb_code_text);
+			report_error("Could not connect to server '%s' (%ld/%ld, %s/%s).",
+				server,(*smb_error_class_ptr),(*smb_error_ptr),smb_class_name,smb_code_text);
 		}
 		else
 		{
-			report_error("Could not connect to server '%s' (%ld, %s).",server,(*error_ptr),posix_strerror(*error_ptr));
+			report_error("Could not connect to server '%s' (%ld, %s).",
+				server,(*error_ptr),posix_strerror(*error_ptr));
 		}
 
 		goto out;
 	}
+
+	if(smba_connect_par != NULL)
+		(*smba_connect_par) = par;
 
 	(*smba_server_ptr) = the_server;
 
