@@ -116,10 +116,11 @@ called sourcery and the shared "all" disk it provides, using the login name
 This would cause a new device by the name of "SMBFS:" to be mounted, showing
 all files and drawers the sourcery server makes available for sharing.
 
-You can also run the smbfs program in the background, like so: "Run >NIL:
-smbfs user=PCGuest service=//sourcery/all".
+You can also run the smbfs program in the background, like so:
 
-This is not recommended, though, because it becomes much harder to tell why
+   Run >NIL: smbfs user=PCGuest service=//sourcery/all
+
+Note that this is not recommended because it becomes much harder to tell why
 the smbfs program did not work correctly (as it invariably will at some
 point). Any error messages which could help in figuring out what the problem
 may have been will be lost.
@@ -194,6 +195,7 @@ parameters):
 
     ADDVOLUME/K
     CACHE=CACHESIZE/N/K
+    CACHETABLES/N/K
     CASE=CASESENSITIVE/S
     CHANGEUSERNAMECASE/K
     CHANGEPASSWORDCASE/K
@@ -201,10 +203,13 @@ parameters):
     CLIENT=CLIENTNAME/K
     CP437/S
     CP850/S
+    DEBUGFILE/K
+    DEBUGLEVEL=DEBUG/N/K
     DEVICE=DEVICENAME/K
     DISABLEEXALL/S
     DOMAIN=WORKGROUP/K
     DST=DSTOFFSET/N/K
+    ERROROUTPUT/K
     MAXNAMELEN/N/K
     MAXTRANSMIT/N/K
     NETBIOS/S
@@ -213,6 +218,8 @@ parameters):
     PROTOCOL/K
     QUIET/S
     RAISEPRIORITY/S
+    READONLY/N/K
+    READTHRESHOLD/N/K
     SERVER=SERVERNAME/K
     SERVICE/A
     SESSIONSETUP/K
@@ -224,6 +231,7 @@ parameters):
     USER=USERNAME/K
     VOLUME=VOLUMENAME/K
     WRITEBEHIND/S
+    WRITETHRESHOLD/N/K
 
 5.1. Server and authentication options
 
@@ -242,10 +250,12 @@ The parameters relevant for this information are described below.
 5.1.1. "SHARE=SERVICE/A"
 
 This parameter takes the form of "//server-name/share-name" or
-"//server-name:port-number/share-name".
+"//server-name:port-number/share-name". You can also use the SMB URI form
+"smb://[[workgroup;]user-name[:password]@]server-name[:port-number]/share".
 
 For example "//sourcery/all", "//192.168.0.1/all", "//nas:445/files",
-"//nas:microsoft-ds/files" would all be valid "SHARE" parameters.
+"//nas:microsoft-ds/files", "smb://sourcery/all", "smb://user@sourcery/all"
+and "smb://user:password@sourcery/all" would all be valid "SHARE" parameters.
 
 In this example "server-name" must be either the IPv4 address of the file
 server to connect to, or the name of the server (note that server names cannot
@@ -502,7 +512,22 @@ You may want to change this requirement, by making the cache smaller or larger
 using the "CACHESIZE" parameter. The size of the cache cannot be smaller than
 10 entries.
 
-5.3.2. "RAISEPRIORITY/S"
+5.3.2. "CACHETABLES/N/K"
+
+The cache can be used only by one directory at a time, which can cause
+problems if you are trying to delete a complete directory hierarchy, with
+several subdirectories (and their respective subdirectories). The cache will
+have to be refilled for each directory currently being processed.
+Consequently, smbfs will lose track of where it was when it read from the
+previous directory it was dealing with and must start over again.
+
+You can mitigate these effects by increasing the number of caches which smbfs
+may use at a time. By default only a single cache, for a single directory, will
+be active ("CACHETABLES=1"). You can use more directory caches if you want to,
+but keep in mind that each cache will consume extra memory. If you want to use
+multiple caches, you might want to reduce the cache size.
+
+5.3.3. "RAISEPRIORITY/S"
 
 The smbfs program can be run at a higher priority than it would normally do
 (normal would be priority 0), which might increase performance, but raise
@@ -510,7 +535,7 @@ system load, too. If the "RAISEPRIORITY" switch is used, the smbfs program
 will run at the same priority as other Amiga file systems do (this would be
 priority 10).
 
-5.3.3. "TIMEOUT/N/K"
+5.3.4. "TIMEOUT/N/K"
 
 The smbfs program may lose the connection to the server during file system
 operations. While it will try to reestablish a connection to the server, some
@@ -521,7 +546,7 @@ You can set the number of seconds which have to pass before the smbfs program
 will stop waiting for the server to respond, shut down the connection and try
 again. For example, "TIMEOUT=5" will select a timeout of 5 seconds.
 
-5.3.4. "WRITEBEHIND/S"
+5.3.5. "WRITEBEHIND/S"
 
 The smbfs program can try to improve write performance by not waiting for the
 server to confirm that all the data just transmitted has in fact been stored.
@@ -532,7 +557,7 @@ Please note that the "WRITEBEHIND" switch has no effect if "PROTOCOL=nt1" is
 used because the smbfs program will then be using a different server write
 command which does not support the "write behind" functionality.
 
-5.3.5. "READTHRESHOLD/N/K" and "WRITETHRESHOLD/N/K"
+5.3.6. "READTHRESHOLD/N/K" and "WRITETHRESHOLD/N/K"
 
 The purpose of smbfs is chiefly to enable you to read and write files stored
 on a networked computer. To this end smbfs tries its best to squeeze as much
@@ -620,7 +645,18 @@ Please note that if the "DISABLEEXALL" switch is used, the smbfs program will
 make files and drawers appear to be "hidden" if their names are longer than
 107 characters.
 
-5.4.3. "MAXNAMELEN/N/K"
+5.4.3. "ERROROUTPUT/K"
+
+The smbfs program will try to print error messages in the shell window in a
+manner which bypasses output redirection. This means that if you decide to
+discard all the output by sending it to NIL:, then smbfs will still be able
+to show you error messages.
+
+Where this is not a useful feature, you can tell the smbfs program to print
+both normal output and error messages in the same manner: use the
+ERROROUTPUT=stdout option.
+
+5.4.4. "MAXNAMELEN/N/K"
 
 Some Amiga programs struggle with file and drawer names longer than 30
 characters. They may malfunction and even crash when the smbfs program
@@ -631,7 +667,7 @@ are longer than a certain number of characters using the "MAXNAMELEN" option.
 For example, "MAXNAMELEN=30" would make files and drawers appear to be
 "hidden" if their names are longer than 30 characters.
 
-5.4.4. "MAXTRANSMIT/N/K"
+5.4.5. "MAXTRANSMIT/N/K"
 
 You can fine-tune the size of the transmission buffer which the smbfs program
 uses when reading and writing files. The server may not have picked a buffer
@@ -643,7 +679,7 @@ buffer size), and the maximum permitted size is 65535 bytes.
 Please note that the transmission buffer size you asked for need not be
 accepted by the file server, which may choose to use a much smaller buffer.
 
-5.4.5. "PROTOCOL/K"
+5.4.6. "PROTOCOL/K"
 
 The smbfs program talks to the file server using a protocol called SMBv1,
 using commands and data structures described by the Common Internet File
@@ -664,7 +700,7 @@ performance with Microsoft Windows systems.
 
 When in doubt, stick with "PROTOCOL=core".
 
-5.4.6. "SESSIONSETUP/K"
+5.4.7. "SESSIONSETUP/K"
 
 If the UNICODE=ON option is in effect, the smbfs program may not be able to
 connect to the server because it expects Unicode text to be used only after
@@ -743,7 +779,15 @@ If you want to use a specific volume name, use the "VOLUME" option, e.g.
 "VOLUME=Sourcery:". Otherwise a volume name derived from the share name will
 be used instead.
 
-5.6.2. "OMITHIDDEN/S"
+5.6.2. "READONLY/S"
+
+If you want to make sure that the contents of the file system mounted cannot
+be modified or deleted by mistake, use the READONLY switch. This switch has
+the same effect as using the "Lock" shell command. However, this protection
+against modification will be enabled as soon as the file system has been
+mounted and the protection cannot be removed with the "Lock" shell command.
+
+5.6.3. "OMITHIDDEN/S"
 
 When requesting a directory listing, the file server may return some files and
 drawers tagged as being hidden. By default smbfs will not treat these "hidden"
@@ -756,7 +800,7 @@ listings by using the "OMITHIDDEN" switch.
 Note that even though a file or drawer may be hidden, you should still be able
 to open and examine it.
 
-5.6.3. "QUIET/S"
+5.6.4. "QUIET/S"
 
 When started from shell, the smbfs program will print a message as soon as the
 connection to the file server has been established.
@@ -764,7 +808,7 @@ connection to the file server has been established.
 If you do not want to see that message displayed, use the "QUIET" parameter.
 Please note that the smbfs program may still show error messages.
 
-5.6.4. "SETENV/S"
+5.6.5. "SETENV/S"
 
 You may want to stop or disable/re-enabled a currently running smbfs program
 through the shell "Break" command, but it may be impractical to figure out
@@ -914,9 +958,9 @@ version 2.1.
 
 8. Credits
 
-The smbfs file system is based upon prior work by Pål-Kristian Engstad, Volker
+The smbfs file system is based upon prior work by Pï¿½l-Kristian Engstad, Volker
 Lendecke, Mark A. Shand, Donald J. Becker, Rick Sladkey, Fred N. van Kempen,
-Eric Kasten and Rudolf König. It is a direct descendant of the "Sharity-Light"
+Eric Kasten and Rudolf Kï¿½nig. It is a direct descendant of the "Sharity-Light"
 file system written by Christian Starkjohann.
 
 Versions including 1.80 incorporate changes from the MorphOS smbfs

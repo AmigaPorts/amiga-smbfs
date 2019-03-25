@@ -2756,7 +2756,7 @@ smbfs 2.8 (19.12.2018)
 
 - The default values for READTHRESHOLD and WRITETHRESHOLD now have the
   effect of transmitting the SMB header and the payload separately,
-  just like it was introduces in version 2.1.
+  just like it was introduced in version 2.1.
 
   Use something like READTHRESHOLD=1500 and WRITETHRESHOLD=1500 to
   send packets smaller than or equal to 1500 bytes as a combined
@@ -2863,3 +2863,195 @@ smbfs 2.12 (5.1.2019)
   "keep alive" handling are scheduled regularly every 10 seconds.
   That way the "keep alive" messages are dealt with without spending
   too much time with WaitSelect().
+
+
+smbfs 2.13 (9.2.2019)
+
+- The ACTION_CREATE_DIR, ACTION_DELETE_OBJECT, ACTION_FINDOUTPUT,
+  ACTION_RENAME_OBJECT, ACTION_SET_DATE, ACTION_SET_FILE_SIZE,
+  ACTION_SET_PROTECT and ACTION_WRITE operations now set use more
+  appropriate error codes instead of always translating an unspecific
+  "access denied" error into "ERROR_READ_PROTECTED". For example, for
+  ACTION_DELETE_OBJECT the new translation of "access denied" will be
+  "ERROR_DELETE_PROTECTED".
+
+- Added the ErrorOutput option, which can be either "stderr" (default)
+  or "stdout". Its purpose is to allow error messages written by
+  smbfs to be redirected to a file, which will not work for AmigaDOS
+  shell versions 36-40 if smbfs uses "stderr". Use ErrorOutput=stdout
+  to be able to redirect all smbfs output, including any error messages,
+  to a file.
+
+- Updated the copyright text.
+
+- Output to console or log files is now line-buffered.
+
+
+smbfs 2.14 (15.2.2019)
+
+- Documented the directory cache a bit better, including the reason
+  why the cache may have been invalidated while the directory
+  contents were being read.
+
+- The directory read operation now verifies that it does not
+  run out of cache entries while it is processing new directory
+  records it received from the server.
+
+- The directory read operation now both detects whether or not the
+  last entry has been read, this information is now also provided
+  to the function which retrieved the directory entries. This
+  change is in support of improved directory entry caching.
+
+- The directory cache now keeps better track of what's actually
+  in it. If a directory entry could not be extracted and decoded,
+  the number of directory entries read would not match the number
+  of entries available from the cache, for example.
+
+- A flag now tracks if the directory cache is valid or not.
+  Previously, checking for a valid cache involved looking at
+  a NULL pointer.
+
+- If allocating memory for the directory cache failed partly, then
+  there may have been invalid string pointers in the cache table,
+  leading to a crash when trying to release the cache. Fixed.
+
+- Adding another entry to the cache, invalidating the cache or
+  resetting the cache now all use dedicated functions instead of
+  directly manipulating the assorted data structures.
+
+
+smbfs 2.15 (16.2.2019)
+
+- Added more debug output to the cache free/invalidate/fill
+  functionality.
+
+- The Action_ExamineNext() function could omit the last directory
+  entry. Oops.
+
+
+smbfs 2.16 (17.2.2019)
+
+- Simplified the directory cache size change functionality.
+
+- Added the CACHETABLES option, which tells smbfs how many individual
+  directory caches it should be using (default: 1). Each directory cache
+  can be used by one directory at a time.
+
+  If you are deleting a directory tree, including subdirectories, etc.
+  then smbfs will be limited in keeping track of what it deleted, and what
+  directory is next up for deletion.
+
+  With only a single directory cache, it will be limited to deleting a
+  subdirectory's contents, but forget about its parent directory, for
+  example, and thereby end up skipping entries which should have been
+  deleted.
+
+  This can be annoying because you will have to repeat the delete operation
+  several times over until everything has been deleted. Increasing the
+  number of cache tables can help, at the expense of extra memory.
+
+  Increasing the number of cache tables can also improve performance if
+  several programs are examining the contents of directories at the same
+  time.
+
+
+smbfs 2.17 (18.2.2019)
+
+- Simplified the cache table "aging", removing duplicate code.
+
+- Verified that the CACHETABLE settings do have a positive effect on
+  the problematic "delete directory-name all" case which almost always
+  failed to delete the entire directory tree.
+
+
+smbfs 2.18 (21.2.2019)
+
+- The ERROROUTPUT option as released in version 2.17 did not work at all. I
+  wonder how I managed to test it successfully :-/
+
+- Rewrote the smb_proc_readdir_short() and smb_proc_readdir_long() functions
+  so that they tell the server exactly how many directory entries they are
+  able to receive. Previously, the server could deliver more, with
+  interesting consequences.
+
+- smb_proc_readdir_long() now verifies that the server's response parameter
+  and data are in order, and it also makes sure not to read more from
+  the response data buffer than there is available when decoding directory
+  entries.
+
+- smb_proc_readdir_long() now updates the scan resume information for every
+  directory entry it can process.
+
+- smb_proc_readdir_long() now actually uses the scan resume information
+  when asked to resume scanning. This means, for example, if the directory
+  cache only has room for 60 entries, then smb_proc_readdir_long() will
+  read up to 60 entries, get called again, and resume filling the cache
+  with the next entry provided by the server. This never worked anywhere
+  near correctly before.
+
+
+smbfs 2.19 (23.2.2019)
+
+- smb_proc_readdir_short() now updates the scan resume information for every
+  directory entry it can process and actually uses the scan resume information
+  when asked to resume scanning.
+
+- If the directory cache becomes stale before the contents have been processed,
+  scanning will have to be restarted. smbfs now tells the server that the
+  scan operation has been aborted before it is started again.
+
+- Directory scanning in combination with deletion operations can collapse if
+  the directory cache becomes stale before all the relevant entries have been
+  processed. You can now tune how long the cache will remain active, which
+  previously was a period of 5 seconds. The current default is 10 seconds,
+  which definitely helps. Use the new CACHEEXPIRES option to change how long
+  the cache is considered good enough.
+
+
+smbfs 2.20 (27.2.2019)
+
+- If the Examine/ExNext/ExAll functions need to restart directory scanning,
+  the cache maintained by the smbfs directory reader is now always cleared.
+
+- Removed the directory cache expiration time feature, along with the
+  just-introduced CACHEEXPIRES option. The context in which the expiration
+  time was used did not justify it as a feature. It looked more like a bug...
+
+- Rewrote the smba_readdir() function to perform its only task in a much
+  simpler manner. It now either fills the directory cache or retrieves
+  the cache entries to be delivered to the caller, resuming the retrieval
+  at a predefined position if required.
+
+
+smbfs 2.21 (9.3.2019)
+
+- Added more diagnostic output and debug functionality, e.g. regarding
+  how many directory caches are currently being used.
+
+- Long name directory scanning is a bit more paranoid when retrying a
+  scan operation which might have been triggered by the server connection
+  getting dropped.
+
+- Added the new READONLY option (why stop at 47 options when you can
+  have 48?) which makes the file system read-only by default and does not
+  require you to use the "Lock" shell command to achieve the same effect.
+  Note that the shell "Lock" command cannot be used to turn the read-only
+  mode off again.
+
+- Added support for the smb:// URI scheme, which means that instead of
+  using "smbfs username=barney password=secret domain=workgroup //nas:445/share"
+  you can now use "smbfs smb://workgroup;barney:secret@nas:445/share" instead.
+  It is a bit shorter than the alternative and has an advantage in allowing
+  you to reuse smb:// URLs which you know work well on other systems.
+
+
+smbfs 2.22 (9.3.2019)
+
+- The memory pool initialization should have happened after having
+  initialized the command line argument data, not before it.
+
+- I broke the automatic device name ("smbfs0:" .. "smbfs99:") initialization
+  at some point. Ouch :-(  The revised code now starts with "smbfs:", then
+  tries "smbfs0:" through "smbfs99:" until it has picked a unique file
+  system device name. This is consistent with the old behaviour of trying
+  to use "smbfs:" if no device specific name has been requested.

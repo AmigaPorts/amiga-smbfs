@@ -3,7 +3,7 @@
  *
  * SMB file system wrapper for AmigaOS, using the AmiTCP V3 API
  *
- * Copyright (C) 2000-2018 by Olaf `Olsen' Barthel <obarthel -at- gmx -dot- net>
+ * Copyright (C) 2000-2019 by Olaf 'Olsen' Barthel <obarthel -at- gmx -dot- net>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -30,7 +30,9 @@
  * Fritz!Box: smbfs debuglevel=2 debugfile=ram:fritz.nas.log user=nas password=nas volume=fritz.nas //fritzbox-3272/fritz.nas
  * Samba 4.6.7: smbfs debuglevel=2 debugfile=ram:ubuntu-17.log volume=ubuntu-test //ubuntu-17-olaf/test
  * Samba 4.7.6: smbfs debuglevel=2 debugfile=ram:ubuntu-18.log volume=ubuntu-test //ubuntu-18-olaf/test
+ * Samba 4.7.6: smbfs debuglevel=2 debugfile=ram:ubuntu-18.log cachesize=30 volume=ubuntu-etc //ubuntu-18-olaf/etc
  * Samba 3.0.25: smbfs debuglevel=2 debugfile=ram:samba-3.0.25.log user=olsen password=... volume=olsen //192.168.1.118/olsen
+ * Samba 3.0.25: smbfs debuglevel=2 debugfile=ram:samba-3.0.25.log smb://olsen:...@192.168.1.118/olsen
  *
  * diskspeed drive olsen:Documents dir seek fast byte nocpu
  */
@@ -45,6 +47,7 @@
 #include "errors.h"
 #include "quad_math.h"
 #include "dump_smb.h"
+#include "parse-smb-url.h"
 
 /****************************************************************************/
 
@@ -263,8 +266,8 @@ static ULONG stack_usage_exit(const struct StackSwapStruct * stk);
 static LONG CVSPrintf(const TEXT * format_string, APTR args);
 static int LocalVSNPrintf(STRPTR buffer, int limit, const TEXT * formatString, APTR args);
 static void cleanup(void);
-static BOOL setup(const TEXT * program_name, const TEXT * service, const TEXT * workgroup, STRPTR username, STRPTR opt_password, BOOL opt_change_username_case, BOOL opt_change_password_case, const TEXT * opt_clientname, const TEXT * opt_servername, int opt_cachesize, int opt_max_transmit, int opt_timeout, LONG *opt_time_zone_offset, LONG *opt_dst_offset, BOOL opt_raw_smb, BOOL opt_unicode, BOOL opt_prefer_core_protocol, BOOL opt_session_setup_delay_unicode, BOOL opt_write_behind, int opt_smb_request_write_threshold, int opt_smb_request_read_threshold, BOOL scatter_gather, BOOL tcp_no_delay, int socket_receive_buffer_size, int socket_send_buffer_size, const TEXT * device_name, const TEXT * volume_name, BOOL add_volume, const TEXT * translation_file);
-static void file_system_handler(BOOL raise_priority, const TEXT * device_name, const TEXT * volume_name, const TEXT * service_name);
+static BOOL setup(const TEXT * program_name, const TEXT * service, const TEXT * workgroup, STRPTR username, STRPTR opt_password, BOOL opt_change_username_case, BOOL opt_change_password_case, const TEXT * opt_clientname, const TEXT * opt_servername, int opt_cachesize, int opt_cache_tables, int opt_max_transmit, int opt_timeout, LONG *opt_time_zone_offset, LONG *opt_dst_offset, BOOL opt_raw_smb, BOOL opt_unicode, BOOL opt_prefer_core_protocol, BOOL opt_session_setup_delay_unicode, BOOL opt_write_behind, int opt_smb_request_write_threshold, int opt_smb_request_read_threshold, BOOL scatter_gather, BOOL tcp_no_delay, int socket_receive_buffer_size, int socket_send_buffer_size, const TEXT * device_name, const TEXT * volume_name, BOOL add_volume, const TEXT * translation_file);
+static void file_system_handler(BOOL raise_priority, const TEXT * volume_name, const TEXT * service_name);
 
 /****************************************************************************/
 
@@ -325,6 +328,8 @@ static struct MsgPort *		FileSystemPort;
 
 static smba_server_t *		ServerData;
 
+static const TEXT *			ErrorOutput;
+
 static BOOL					Quit;
 static BOOL					Quiet;
 static BOOL					CaseSensitive;
@@ -337,6 +342,8 @@ static BOOL					OverrideLocaleTimeZone;
 
 static BOOL					WriteProtected;
 static ULONG				WriteProtectKey;
+
+static BOOL					ReadOnly;
 
 static struct MinList		FileList;
 static struct MinList		LockList;
@@ -440,6 +447,7 @@ _start(STRPTR args, LONG args_length, struct ExecBase * exec_base)
 	 * whether we could get them.
 	 */
 	DOSBase = OpenLibrary("dos.library",0);
+	UtilityBase = OpenLibrary("utility.library",37);
 
 	#if defined(__amigaos4__)
 	{
@@ -452,13 +460,7 @@ _start(STRPTR args, LONG args_length, struct ExecBase * exec_base)
 				DOSBase = NULL;
 			}
 		}
-	}
-	#endif /* __amigaos4__ */
 
-	UtilityBase = OpenLibrary("utility.library",37);
-
-	#if defined(__amigaos4__)
-	{
 		if(UtilityBase != NULL)
 		{
 			IUtility = (struct UtilityIFace *)GetInterface(UtilityBase, "main", 1, 0);
@@ -765,6 +767,7 @@ main(void)
 		SWITCH	CaseSensitive;
 		SWITCH	OmitHidden;
 		SWITCH	Quiet;
+		SWITCH	ReadOnly;
 		SWITCH	RaisePriority;
 		SWITCH	SetEnv;
 		KEY		ClientName;
@@ -774,11 +777,14 @@ main(void)
 		KEY		AddVolume;
 		NUMBER	MaxNameLen;
 		NUMBER	CacheSize;
+		NUMBER	CacheTables;
+		NUMBER	CacheExpires;
 		SWITCH	DisableExAll;
 		NUMBER	MaxTransmit;
 		NUMBER	Timeout;
 		NUMBER	TimeZoneOffset;
 		NUMBER	DSTOffset;
+		KEY		ErrorOutput;
 		KEY		Protocol;
 		SWITCH	NetBIOSTransport;
 		SWITCH	WriteBehind;
@@ -812,6 +818,7 @@ main(void)
 		"CASE=CASESENSITIVE/S,"
 		"OMITHIDDEN/S,"
 		"QUIET/S,"
+		"READONLY/S,"
 		"RAISEPRIORITY/S,"
 		"SETENV/S,"
 		"CLIENT=CLIENTNAME/K,"
@@ -821,11 +828,14 @@ main(void)
 		"ADDVOLUME/K,"
 		"MAXNAMELEN/N/K,"
 		"CACHE=CACHESIZE/N/K,"
+		"CACHETABLES/N/K,"
+		"CACHEEXPIRES/N/K,"
 		"DISABLEEXALL/S,"
 		"MAXTRANSMIT/N/K,"
 		"TIMEOUT/N/K,"
 		"TZ=TIMEZONEOFFSET/N/K,"
 		"DST=DSTOFFSET/N/K,"
+		"ERROROUTPUT/K,"
 		"PROTOCOL/K,"
 		"NETBIOS/S,"
 		"WRITEBEHIND/S,"
@@ -854,6 +864,7 @@ main(void)
 	LONG result = RETURN_FAIL;
 	LONG tz_number, dst_number, debug_number;
 	LONG cache_size = 0;
+	LONG cache_tables = 1;
 	LONG max_transmit = -1;
 	LONG smb_write_threshold = 0;
 	LONG smb_read_threshold = 0;
@@ -864,6 +875,7 @@ main(void)
 	TEXT env_workgroup_name[17];
 	TEXT env_user_name[64];
 	TEXT env_password[64];
+	struct smb_url_args * smb_url_args = NULL;
 
 	/* Don't emit any debugging output before we are ready. */
 	SETDEBUGLEVEL(0);
@@ -879,12 +891,23 @@ main(void)
 	 */
 	memset(&args,0,sizeof(args));
 
+	/* Make sure that we can allocate memory from the
+	 * local pool.
+	 */
+	MemoryPool = CreatePool(MEMF_ANY|MEMF_PUBLIC, 4096, 4096);
+	if(MemoryPool == NULL)
+	{
+		report_error("Could not create memory pool.");
+		goto out;
+	}
+
 	/* If this program was launched from Workbench, the
-	 * command parameters will have to be from the icon
-	 * tool types.
+	 * command parameters will have to be read from the
+	 * icon tool types.
 	 */
 	if(WBStartup != NULL)
 	{
+		TEXT * smb_url = NULL;
 		TEXT * icon_file_name;
 		BPTR icon_file_lock;
 		STRPTR str;
@@ -978,6 +1001,8 @@ main(void)
 				{
 					D_S(struct FileInfoBlock, fib);
 
+					SetVBuf(debug_file, NULL, BUF_LINE, 512);
+
 					Seek(debug_file,0,OFFSET_END);
 
 					close_debug_file = TRUE;
@@ -1016,6 +1041,71 @@ main(void)
 			goto out;
 		}
 
+		/* Check if the service name is an SMB url. */
+		if(could_be_smb_url(args.Service))
+		{
+			smb_url = (TEXT *)args.Service;
+
+			smb_url_args = parse_smb_url_args(smb_url);
+			if(smb_url_args == NULL)
+			{
+				report_error("Not enough memory.");
+				goto out;
+			}
+		}
+
+		if(smb_url_args != NULL)
+		{
+			/* We need both a server and a share name for the
+			 * SMB URL to be useful.
+			 */
+			if(smb_url_args->server != NULL && smb_url_args->share != NULL)
+			{
+				STRPTR new_service;
+				int new_service_size;
+
+				/* Combine share name, an optional port number/service name
+				 * and the share name.
+				 */
+				new_service_size = 1 +
+					2 + strlen(smb_url_args->server) +
+					1 + strlen(smb_url_args->share);
+
+				if(smb_url_args->port != NULL)
+					new_service_size += 1 + strlen(smb_url_args->port);
+
+				new_service = malloc(new_service_size);
+				if(new_service != NULL)
+				{
+					strlcpy(new_service, "//", new_service_size);
+					strlcat(new_service, smb_url_args->server, new_service_size);
+
+					if(smb_url_args->port != NULL)
+					{
+						strlcat(new_service, ":", new_service_size);
+						strlcat(new_service, smb_url_args->port, new_service_size);
+					}
+
+					strlcat(new_service, "/", new_service_size);
+					strlcat(new_service, smb_url_args->share, new_service_size);
+
+					D(("SMB URL translates into service '%s'.", new_service));
+
+					args.Service = new_service;
+				}
+				else
+				{
+					report_error("Not enough memory.");
+					goto out;
+				}
+			}
+			else
+			{
+				report_error("Service '%s' lacks a complete server and share description.", smb_url);
+				smb_url_args = NULL;
+			}
+		}
+
 		/* Set up the name of the program, as it will be
 		 * displayed in error requesters.
 		 */
@@ -1025,17 +1115,30 @@ main(void)
 		if(NewProgramName != NULL)
 			LocalSNPrintf(NewProgramName,size,"%s '%s'",icon_file_name,args.Service);
 
-		args.Workgroup = get_icon_tool_type_value("DOMAIN","WORKGROUP");
-		args.UserName = get_icon_tool_type_value("USER","USERNAME");
+		/* Use the SMB URL's domain information, if provided. */
+		if(smb_url_args != NULL && smb_url_args->domain != NULL)
+			args.Workgroup = smb_url_args->domain;
+		else
+			args.Workgroup = get_icon_tool_type_value("DOMAIN", "WORKGROUP");
+
+		/* Use the SMB URL's user name information, if provided. */
+		if(smb_url_args != NULL && smb_url_args->username != NULL)
+			args.UserName = smb_url_args->username;
+		else
+			args.UserName = get_icon_tool_type_value("USER", "USERNAME");
+
+		/* Use the SMB URL's password information, if provided. */
+		if(smb_url_args != NULL && smb_url_args->password != NULL)
+			args.Password = smb_url_args->password;
+		else
+			args.Password = get_icon_tool_type_value("PASSWORD", NULL);
 
 		str = get_icon_tool_type_value("CHANGEUSERNAMECASE", NULL);
 		args.ChangeUserNameCase = (str != NULL) ? str : (STRPTR)"yes";
 
-		args.Password = get_icon_tool_type_value("PASSWORD", NULL);
-
 		args.ChangePasswordCase = get_icon_tool_type_value("CHANGEPASSWORDCASE", NULL);
 		if(args.ChangePasswordCase == NULL && get_icon_tool_type_value("CHANGECASE", NULL) != NULL)
-			args.ChangePasswordCase = "yes";
+			args.ChangePasswordCase = (STRPTR)"yes";
 
 		args.TCPDelay = get_icon_tool_type_value("TCPDELAY", NULL);
 		if(args.TCPDelay == NULL && get_icon_tool_type_value("TCPNODELAY", "TCP_NODELAY") != NULL)
@@ -1044,6 +1147,7 @@ main(void)
 		args.DisableExAll = get_icon_tool_type_value("DISABLEEXALL", NULL) != NULL;
 		args.OmitHidden = get_icon_tool_type_value("OMITHIDDEN", NULL) != NULL;
 		args.Quiet = get_icon_tool_type_value("QUIET", NULL) != NULL;
+		args.ReadOnly = get_icon_tool_type_value("READONLY", NULL) != NULL;
 		args.RaisePriority = get_icon_tool_type_value("RAISEPRIORITY", NULL) != NULL;
 		args.CaseSensitive = get_icon_tool_type_value("CASE", "CASESENSITIVE") != NULL;
 		args.NetBIOSTransport = get_icon_tool_type_value("NETBIOS", NULL) != NULL;
@@ -1139,6 +1243,18 @@ main(void)
 			args.CacheSize = &cache_size;
 		}
 
+		str = get_icon_tool_type_value("CACHETABLES",NULL);
+		if(str != NULL)
+		{
+			if(StrToLong(str,&cache_tables) == -1)
+			{
+				report_error("Invalid number '%s' for 'CACHETABLES' parameter.",str);
+				goto out;
+			}
+
+			args.CacheTables = &cache_tables;
+		}
+
 		str = get_icon_tool_type_value("MAXTRANSMIT", NULL);
 		if(str != NULL)
 		{
@@ -1224,6 +1340,8 @@ main(void)
 				{
 					D_S(struct FileInfoBlock, fib);
 
+					SetVBuf(debug_file, NULL, BUF_LINE, 512);
+
 					Seek(debug_file,0,OFFSET_END);
 
 					close_debug_file = TRUE;
@@ -1254,6 +1372,73 @@ main(void)
 		#endif /* DEBUG */
 
 		D(("%s (%s)", VERS, DATE));
+
+		if(could_be_smb_url(args.Service))
+		{
+			smb_url_args = parse_smb_url_args(args.Service);
+			if(smb_url_args != NULL)
+			{
+				if(smb_url_args->server != NULL && smb_url_args->share)
+				{
+					STRPTR new_service;
+					int new_service_size;
+
+					new_service_size = 1 +
+						2 + strlen(smb_url_args->server) +
+						1 + strlen(smb_url_args->share);
+
+					if(smb_url_args->port != NULL)
+						new_service_size += 1 + strlen(smb_url_args->port);
+
+					new_service = malloc(new_service_size);
+					if(new_service != NULL)
+					{
+						strlcpy(new_service, "//", new_service_size);
+						strlcat(new_service, smb_url_args->server, new_service_size);
+
+						if(smb_url_args->port != NULL)
+						{
+							strlcat(new_service, ":", new_service_size);
+							strlcat(new_service, smb_url_args->port, new_service_size);
+						}
+
+						strlcat(new_service, "/", new_service_size);
+						strlcat(new_service, smb_url_args->share, new_service_size);
+
+						D(("SMB URL translates into service '%s'.", new_service));
+
+						args.Service = new_service;
+
+						/* Use the domain, user name and password information,
+						 * if provided.
+						 */
+						if(smb_url_args->domain != NULL)
+							args.Workgroup = smb_url_args->domain;
+
+						if(smb_url_args->username != NULL)
+							args.UserName = smb_url_args->username;
+
+						if(smb_url_args->password != NULL)
+							args.Password = smb_url_args->password;
+					}
+					else
+					{
+						PrintFault(ERROR_NO_FREE_STORE, FilePart(program_name));
+						goto out;
+					}
+				}
+				else
+				{
+					report_error("Service '%s' lacks a complete server and share description.", args.Service);
+					goto out;
+				}
+			}
+			else
+			{
+				PrintFault(ERROR_NO_FREE_STORE, FilePart(program_name));
+				goto out;
+			}
+		}
 
 		ASSERT( args.Service != NULL );
 
@@ -1359,16 +1544,25 @@ main(void)
 	if(args.TCPDelay == NULL && args.TCPNoDelay)
 		args.TCPDelay = "no";
 
-	/* Use the default if no device or volume name is given. */
-	if(args.DeviceName == NULL && args.VolumeName == NULL)
-	{
-		args.DeviceName = "SMBFS";
-
-		D(("no device/volume name given, using 'devicename=%s' instead.", args.DeviceName));
-	}
-
 	if(args.VolumeName != NULL)
 		args.AddVolume = "yes";
+
+	/* Where do we send error messages to if started from shell? */
+	if(WBStartup == NULL)
+	{
+		if(args.ErrorOutput != NULL && Stricmp(args.ErrorOutput,"stderr") == SAME)
+			args.ErrorOutput = NULL;
+
+		if(args.ErrorOutput != NULL && Stricmp(args.ErrorOutput,"stdout") != SAME)
+		{
+			report_error("'ERROROUTPUT' parameter must be either 'STDERR' or 'STDOUT'.");
+			goto out;
+		}
+
+		D(("using 'erroroutput=%s'.", (args.ErrorOutput != NULL) ? "stdout" : "stderr"));
+
+		ErrorOutput = args.ErrorOutput;
+	}
 
 	/* Restrict the command set which smbfs uses? */
 	if(args.Protocol == NULL)
@@ -1477,6 +1671,16 @@ main(void)
 		}
 	}
 
+	if(args.CacheTables != NULL)
+	{
+		cache_tables = (*args.CacheTables);
+		if(cache_tables <= 0)
+		{
+			report_error("'CACHETABLES' parameter must be > 0.");
+			goto out;
+		}
+	}
+
 	if(args.MaxTransmit != NULL)
 	{
 		max_transmit = (*args.MaxTransmit);
@@ -1528,6 +1732,9 @@ main(void)
 	D(("disable exall = %s", DisableExAll ? "yes": "no"));
 	D(("case sensitive = %s", CaseSensitive ? "yes": "no"));
 	D(("omit hidden = %s", OmitHidden ? "yes": "no"));
+	D(("raise priority = %s", args.RaisePriority ? "yes": "no"));
+	D(("read only = %s", args.ReadOnly ? "yes": "no"));
+	D(("quiet = %s", args.Quiet ? "yes": "no"));
 
 	/* Enable SMB packet decoding, but only if not started from Workbench. */
 	#if defined(DUMP_SMB)
@@ -1609,6 +1816,7 @@ main(void)
 
 	D(("max name length = %ld.", MaxNameLen));
 	D(("cache size = %ld.", cache_size));
+	D(("cache tables = %ld.", cache_tables));
 	D(("max transmit = %ld.", max_transmit));
 	D(("timeout = %ld.", timeout));
 
@@ -1623,6 +1831,7 @@ main(void)
 		args.ClientName,
 		args.ServerName,
 		cache_size,
+		cache_tables,
 		max_transmit,
 		timeout,
 		args.TimeZoneOffset,
@@ -1646,6 +1855,7 @@ main(void)
 		char setenv_name[40];
 
 		Quiet = args.Quiet;
+		ReadOnly = args.ReadOnly;
 
 		if(Locale != NULL)
 			SHOWVALUE(Locale->loc_GMTOffset);
@@ -1697,7 +1907,7 @@ main(void)
 			}
 		}
 
-		file_system_handler(args.RaisePriority,args.DeviceName,args.VolumeName,args.Service);
+		file_system_handler(args.RaisePriority, args.VolumeName, args.Service);
 
 		/* Clean up after the environment variable... */
 		if(setenv_name[0] != '\0')
@@ -1735,6 +1945,12 @@ main(void)
 		SETDEBUGLEVEL(0);
 
 		Close(debug_file);
+	}
+
+	if(MemoryPool != NULL)
+	{
+		DeletePool(MemoryPool);
+		MemoryPool = NULL;
 	}
 
 	return(result);
@@ -2098,39 +2314,68 @@ report_error(const TEXT * fmt,...)
 
 			GetProgramName(program_name,sizeof(program_name));
 
-			if(this_process->pr_CES != ZERO)
+			/* Print the error message on the standard error output
+			 * stream?
+			 */
+			if(ErrorOutput == NULL)
 			{
-				output = this_process->pr_CES;
+				/* Do we have a valid error output stream? This
+				 * likely won't work with the V36-V40 shell, but
+				 * we check this anyway.
+				 */
+				if(this_process->pr_CES != ZERO)
+				{
+					output = this_process->pr_CES;
+				}
+				/* So we need to try to write straight to the
+				 * output window.
+				 */
+				else
+				{
+					/* Can we write straight to the output window? */
+					output = Open("CONSOLE:", MODE_NEWFILE);
+					if(output != ZERO)
+					{
+						SetVBuf(output, NULL, BUF_LINE, 512);
+
+						close_output = TRUE;
+					}
+					/* Fall back to using the standard output stream. */
+					else
+					{
+						output = Output();
+					}
+				}
 			}
+			/* No, we use the standard output stream. */
 			else
 			{
-				output = Open("CONSOLE:", MODE_NEWFILE);
-				if(output != ZERO)
-					close_output = TRUE;
-				else
-					output = Output();
+				output = Output();
 			}
 
-			LocalFPrintf(output, "%s: ",FilePart(program_name));
-
-			#if defined(__amigaos4__)
+			if(output != ZERO)
 			{
-				va_startlinear(args,fmt);
-				VFPrintf(output, fmt, va_getlinearva(args,APTR));
-				va_end(args);
-			}
-			#else
-			{
-				va_start(args,fmt);
-				VFPrintf(output,fmt,args);
-				va_end(args);
-			}
-			#endif /* __amigaos4__ */
+				LocalFPrintf(output, "%s: ",FilePart(program_name));
 
-			LocalFPrintf(output, "\n");
+				#if defined(__amigaos4__)
+				{
+					va_startlinear(args,fmt);
+					VFPrintf(output, fmt, va_getlinearva(args,APTR));
+					va_end(args);
+				}
+				#else
+				{
+					va_start(args,fmt);
+					VFPrintf(output,fmt,args);
+					va_end(args);
+				}
+				#endif /* __amigaos4__ */
 
-			if(close_output)
-				Close(output);
+				LocalFPrintf(output, "\n");
+
+				if(close_output)
+					Close(output);
+			}
 		}
 	}
 }
@@ -2194,6 +2439,37 @@ allocate_memory(LONG size)
 					max_memory_allocated = total_memory_allocated;
 			}
 			#endif /* DEBUG */
+
+			result = mem;
+		}
+	}
+
+	return(result);
+}
+
+/****************************************************************************/
+
+APTR
+allocate_cleared_memory(LONG count, LONG record_size)
+{
+	APTR result = NULL;
+	LONG size;
+
+	size = count * record_size;
+
+	if(size > 0)
+	{
+		ULONG * mem;
+
+		size = sizeof(*mem) + ((size + 7) & ~7UL);
+
+		mem = AllocPooled(MemoryPool,size);
+
+		if(mem != NULL)
+		{
+			(*mem++) = size;
+
+			memset(mem, 0, size);
 
 			result = mem;
 		}
@@ -3866,12 +4142,6 @@ cleanup(void)
 		LocaleBase = NULL;
 	}
 
-	if(MemoryPool != NULL)
-	{
-		DeletePool(MemoryPool);
-		MemoryPool = NULL;
-	}
-
 	PROFILE_ON();
 
 	LEAVE();
@@ -3916,6 +4186,7 @@ setup(
 	const TEXT *	opt_clientname,
 	const TEXT *	opt_servername,
 	int				opt_cachesize,
+	int				opt_cache_tables,
 	int				opt_max_transmit,
 	int				opt_timeout,
 	LONG *			opt_time_zone_offset,
@@ -3969,13 +4240,6 @@ setup(
 		splay_tree_init(&LockAddressTree, compare_file_or_lock_by_address);
 	}
 	#endif /* USE_SPLAY_TREE */
-
-	MemoryPool = CreatePool(MEMF_ANY|MEMF_PUBLIC, 4096, 4096);
-	if(MemoryPool == NULL)
-	{
-		report_error("Could not create memory pool.");
-		goto out;
-	}
 
 	LocaleBase = OpenLibrary("locale.library",38);
 
@@ -4166,6 +4430,7 @@ setup(
 		opt_clientname,
 		opt_servername,
 		opt_cachesize,
+		opt_cache_tables,
 		opt_max_transmit,
 		opt_timeout,
 		opt_raw_smb,
@@ -4225,17 +4490,20 @@ setup(
 		if(FindDosEntry(dl,name,LDF_DEVICES) != NULL)
 			device_exists = TRUE;
 	}
-	/* Otherwise pick a device name of the form SMBFS0..SMBFS99,
+	/* Otherwise pick a device name of the form SMBFS, SMBFS0..SMBFS99,
 	 * which is not currently in use.
 	 */
 	else
 	{
 		dl = LockDosList(LDF_WRITE|LDF_VOLUMES|LDF_DEVICES);
 
-		/* Try to find a unique device name out of 100 possible options. */
-		for(i = 0 ; i < 100 ; i++)
+		/* Try to find a unique device name out of 101 possible options. */
+		for(i = -1 ; i < 100 ; i++)
 		{
-			LocalSNPrintf(name,sizeof(name),"SMBFS%ld",i);
+			if(i == -1)
+				strlcpy(name,"SMBFS",sizeof(name));
+			else
+				LocalSNPrintf(name,sizeof(name),"SMBFS%ld",i);
 
 			device_exists = (BOOL)(FindDosEntry(dl,name,LDF_DEVICES) != NULL);
 			if(NOT device_exists)
@@ -5801,7 +6069,7 @@ Action_DeleteObject(
 		goto out;
 	}
 
-	if(WriteProtected)
+	if(ReadOnly || WriteProtected)
 	{
 		error = ERROR_DISK_WRITE_PROTECTED;
 		goto out;
@@ -5953,6 +6221,10 @@ Action_DeleteObject(
 	free_memory(full_name);
 	free_memory(full_parent_name);
 
+	/* This can never be a read protection error (EACCES). */
+	if(error == ERROR_READ_PROTECTED)
+		error = ERROR_DELETE_PROTECTED;
+
 	(*error_ptr) = error;
 
 	RETURN(result);
@@ -5988,7 +6260,7 @@ Action_CreateDir(
 		goto out;
 	}
 
-	if(WriteProtected)
+	if(ReadOnly || WriteProtected)
 	{
 		error = ERROR_DISK_WRITE_PROTECTED;
 		goto out;
@@ -6087,6 +6359,10 @@ Action_CreateDir(
 	free_memory(temp);
 	free_memory(full_name);
 	free_memory(ln);
+
+	/* This can never be a read protection error (EACCES). */
+	if(error == ERROR_READ_PROTECTED)
+		error = ERROR_WRITE_PROTECTED;
 
 	(*error_ptr) = error;
 
@@ -6507,7 +6783,7 @@ Action_SetProtect(
 		goto out;
 	}
 
-	if(WriteProtected)
+	if(ReadOnly || WriteProtected)
 	{
 		error = ERROR_DISK_WRITE_PROTECTED;
 		goto out;
@@ -6634,6 +6910,10 @@ Action_SetProtect(
 
 	free_memory(full_name);
 
+	/* This can never be a read protection error (EACCES). */
+	if(error == ERROR_READ_PROTECTED)
+		error = ERROR_WRITE_PROTECTED;
+
 	(*error_ptr) = error;
 
 	RETURN(result);
@@ -6675,7 +6955,7 @@ Action_RenameObject(
 		goto out;
 	}
 
-	if(WriteProtected)
+	if(ReadOnly || WriteProtected)
 	{
 		error = ERROR_DISK_WRITE_PROTECTED;
 		goto out;
@@ -6798,6 +7078,10 @@ Action_RenameObject(
 	free_memory(parent_source_name);
 	free_memory(parent_destination_name);
 
+	/* This can never be a read protection error (EACCES). */
+	if(error == ERROR_READ_PROTECTED)
+		error = ERROR_WRITE_PROTECTED;
+
 	(*error_ptr) = error;
 
 	RETURN(result);
@@ -6835,7 +7119,7 @@ Action_DiskInfo(
 
 		if(smba_statfs(ServerData,&block_size,&num_blocks,&num_blocks_free,&error) >= 0)
 		{
-			if(NOT WriteProtected)
+			if(NOT ReadOnly && NOT WriteProtected)
 				id->id_DiskState = ID_VALIDATED;
 
 			SHOWMSG("got the disk data");
@@ -7404,6 +7688,7 @@ Action_ExamineNext(
 	struct LockNode * ln;
 	LONG result = DOSFALSE;
 	int error = OK;
+	BOOL restart;
 	LONG offset;
 
 	ENTER();
@@ -7445,12 +7730,14 @@ Action_ExamineNext(
 	if(ln->ln_RestartExamine)
 	{
 		offset = 0;
+		restart = TRUE;
 
 		ln->ln_RestartExamine = FALSE;
 	}
 	else
 	{
 		offset = fib->fib_DiskKey;
+		restart = FALSE;
 	}
 
 	memset(fib,0,sizeof(*fib));
@@ -7458,9 +7745,7 @@ Action_ExamineNext(
 	SHOWMSG("calling 'smba_readdir'");
 	SHOWVALUE(offset);
 
-	smba_readdir(ln->ln_File,offset,fib,(smba_callback_t)dir_scan_callback_func_exnext,&error);
-
-	if(error != OK)
+	if (smba_readdir(ln->ln_File,offset,restart,fib,(smba_callback_t)dir_scan_callback_func_exnext,NULL,&error) < 0)
 	{
 		SHOWMSG("error whilst scanning");
 		SHOWVALUE(error);
@@ -7899,7 +8184,9 @@ Action_ExamineAll(
 	struct LockNode * ln;
 	int record_size;
 	int error = OK;
+	int eof = FALSE;
 	LONG offset;
+	BOOL restart;
 
 	ENTER();
 
@@ -8042,12 +8329,6 @@ Action_ExamineAll(
 
 	SHOWVALUE(ec.ec_RecordSize);
 
-	/* If this 0, we start reading the directory contents beginning
-	 * with the first entry. A value > 0 is supposed to resume
-	 * directory scanning at the given directory entry index.
-	 */
-	offset = eac->eac_LastKey;
-
 	/* Check if we should restart scanning the directory
 	 * contents. This is tricky at best and may produce
 	 * irritating results :(
@@ -8056,9 +8337,15 @@ Action_ExamineAll(
 	{
 		SHOWMSG("restarting directory scanning");
 
+		restart = TRUE;
 		offset = 0;
 
 		ln->ln_RestartExamine = FALSE;
+	}
+	else
+	{
+		restart = FALSE;
+		offset = eac->eac_LastKey;
 	}
 
 	/* Start from the top? Check if the lock actually refers to a directory. */
@@ -8089,10 +8376,7 @@ Action_ExamineAll(
 	SHOWMSG("calling 'smba_readdir'");
 	SHOWVALUE(offset);
 
-	smba_readdir(ln->ln_File,offset,&ec,(smba_callback_t)dir_scan_callback_func_exall,&error);
-
-	/* Did the smba_readdir() run into trouble? */
-	if (error != OK)
+	if (smba_readdir(ln->ln_File,offset,restart,&ec,(smba_callback_t)dir_scan_callback_func_exall,&eof,&error) < 0)
 	{
 		D(("error whilst scanning (errno=%ld)", error));
 
@@ -8347,7 +8631,7 @@ Action_Find(
 		STRPTR dir_name,base_name;
 		smba_file_t * dir;
 
-		if(WriteProtected)
+		if(ReadOnly || WriteProtected)
 		{
 			error = ERROR_DISK_WRITE_PROTECTED;
 			goto out;
@@ -8439,6 +8723,12 @@ Action_Find(
 	free_memory(fn);
 	free_memory(parent_path);
 
+	/* This can never be a read protection error (EACCES) for
+	 * ACTION_FINDOUTPUT.
+	 */
+	if(error == ERROR_READ_PROTECTED && action == ACTION_FINDOUTPUT)
+		error = ERROR_WRITE_PROTECTED;
+
 	(*error_ptr) = error;
 
 	RETURN(result);
@@ -8516,7 +8806,7 @@ Action_Write(
 		goto out;
 	}
 
-	if(WriteProtected)
+	if(ReadOnly || WriteProtected)
 	{
 		error = ERROR_DISK_WRITE_PROTECTED;
 		goto out;
@@ -8546,6 +8836,10 @@ Action_Write(
 	error = OK;
 
  out:
+
+	/* This can never be a read protection error (EACCES). */
+	if(error == ERROR_READ_PROTECTED)
+		error = ERROR_WRITE_PROTECTED;
 
 	(*error_ptr) = error;
 
@@ -8812,7 +9106,7 @@ Action_SetFileSize(
 		goto out;
 	}
 
-	if(WriteProtected)
+	if(ReadOnly || WriteProtected)
 	{
 		error = ERROR_DISK_WRITE_PROTECTED;
 		goto out;
@@ -8903,6 +9197,10 @@ Action_SetFileSize(
 
  out:
 
+	/* This can never be a read protection error (EACCES). */
+	if(error == ERROR_READ_PROTECTED)
+		error = ERROR_WRITE_PROTECTED;
+
 	(*error_ptr) = error;
 
 	RETURN(result);
@@ -8939,7 +9237,7 @@ Action_SetDate(
 		goto out;
 	}
 
-	if(WriteProtected)
+	if(ReadOnly || WriteProtected)
 	{
 		error = ERROR_DISK_WRITE_PROTECTED;
 		goto out;
@@ -9053,6 +9351,10 @@ Action_SetDate(
 		smba_close(ServerData,file);
 
 	free_memory(full_name);
+
+	/* This can never be a read protection error (EACCES). */
+	if(error == ERROR_READ_PROTECTED)
+		error = ERROR_WRITE_PROTECTED;
 
 	(*error_ptr) = error;
 
@@ -9457,7 +9759,7 @@ Action_RenameDisk(
 		goto out;
 	}
 
-	if(WriteProtected)
+	if(ReadOnly || WriteProtected)
 	{
 		error = ERROR_DISK_WRITE_PROTECTED;
 		goto out;
@@ -9709,6 +10011,7 @@ Action_WriteProtect(
 	LONG *	error_ptr)
 {
 	LONG result = DOSFALSE;
+	BOOL changed = FALSE;
 	int error;
 
 	ENTER();
@@ -9731,31 +10034,27 @@ Action_WriteProtect(
 
 			WriteProtected = FALSE;
 
-			if(VolumeNodeAdded)
-			{
-				send_disk_change_notification(IECLASS_DISKREMOVED);
-				send_disk_change_notification(IECLASS_DISKINSERTED);
-			}
+			changed = TRUE;
 		}
 	}
 	else
 	{
-		if(NOT WriteProtected)
-		{
-			WriteProtected = TRUE;
-			WriteProtectKey = key;
-
-			if(VolumeNodeAdded)
-			{
-				send_disk_change_notification(IECLASS_DISKREMOVED);
-				send_disk_change_notification(IECLASS_DISKINSERTED);
-			}
-		}
-		else
+		if(WriteProtected)
 		{
 			error = ERROR_INVALID_LOCK;
 			goto out;
 		}
+
+		WriteProtected = TRUE;
+		WriteProtectKey = key;
+
+		changed = TRUE;
+	}
+
+	if(changed && NOT ReadOnly && VolumeNodeAdded)
+	{
+		send_disk_change_notification(IECLASS_DISKREMOVED);
+		send_disk_change_notification(IECLASS_DISKINSERTED);
 	}
 
 	result = DOSTRUE;
@@ -9822,7 +10121,7 @@ Action_SetComment(
 		goto out;
 	}
 
-	if(WriteProtected)
+	if(ReadOnly || WriteProtected)
 	{
 		error = ERROR_DISK_WRITE_PROTECTED;
 		goto out;
@@ -10114,7 +10413,6 @@ Action_FilesystemAttr(
 static void
 file_system_handler(
 	BOOL			raise_priority,
-	const TEXT *	device_name,
 	const TEXT *	volume_name,
 	const TEXT *	service_name)
 {
@@ -10140,8 +10438,6 @@ file_system_handler(
 
 		if(NOT cli->cli_Background)
 		{
-			TEXT name[MAX_FILENAME_LEN+1];
-			TEXT * dot;
 			LONG max_cli;
 			LONG which;
 			LONG i;
@@ -10164,22 +10460,8 @@ file_system_handler(
 
 			Permit();
 
-			if(volume_name == NULL)
-				strlcpy(name,device_name,sizeof(name));
-			else
-				strlcpy(name,volume_name,sizeof(name));
-
-			/* If the device or volume name had a trailing
-			 * colon character attached, remove it so that the
-			 * output below will always show one colon
-			 * character following the name, and not two.
-			 */
-			dot = (TEXT *)strchr(name, ':');
-			if(dot != NULL)
-				(*dot) = '\0';
-
-			LocalFPrintf(ZERO, "Mounted '%s' as '%s:'; \"Break %ld\" or [Ctrl+C] to stop and unmount... ",
-				service_name,name,which);
+			LocalFPrintf(ZERO, "Mounted '%s' as '%b:'; \"Break %ld\" or [Ctrl+C] to stop and unmount... ",
+				service_name,(volume_name != NULL && VolumeNodeAdded) ? VolumeNode->dol_Name : DeviceNode->dol_Name,which);
 
 			Flush(Output());
 
@@ -11092,4 +11374,15 @@ strlcat(char *dst, const char *src, size_t siz)
 	}
 
 	return(result);
+}
+
+/****************************************************************************/
+
+/* Wrapper function for case-insensitive string comparison, as used
+ * by the SMB url parser.
+ */
+LONG
+strncasecmp(const char *a, const char *b, LONG n)
+{
+	return(Strnicmp((STRPTR)a, (STRPTR)b, n));
 }

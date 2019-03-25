@@ -96,7 +96,7 @@ You can also run the **smbfs** program in the background, like so:
 Run >NIL: smbfs user=PCGuest service=//sourcery/all`
 </pre>
 
-**Note that this is not recommended**, though, because it becomes much harder to tell why the **smbfs** program did not work correctly (as it invariably will at some point). Any error messages which could help in figuring out what the problem may have been will be lost.
+**Note that this is not recommended** because it becomes much harder to tell why the **smbfs** program did not work correctly (as it invariably will at some point). Any error messages which could help in figuring out what the problem may have been will be lost.
 
 If you have trouble setting up the **smbfs** program, first make sure that it works correctly without the `Run >NIL:` instructions and have a look at any error messages it may produce.
 
@@ -151,6 +151,7 @@ Here is how the options look like, in alphabetical order (as command line parame
 <pre>
 ADDVOLUME/K
 CACHE=CACHESIZE/N/K
+CACHETABLES/N/K
 CASE=CASESENSITIVE/S
 CHANGEUSERNAMECASE/K
 CHANGEPASSWORDCASE/K
@@ -164,6 +165,7 @@ DEVICE=DEVICENAME/K
 DISABLEEXALL/S
 DOMAIN=WORKGROUP/K
 DST=DSTOFFSET/N/K
+ERROROUTPUT/K
 MAXNAMELEN/N/K
 MAXTRANSMIT/N/K
 NETBIOS/S
@@ -172,6 +174,7 @@ PASSWORD/K
 PROTOCOL/K
 QUIET/S
 RAISEPRIORITY/S
+READONLY/N/K
 READTHRESHOLD/N/K
 SERVER=SERVERNAME/K
 SERVICE/A
@@ -199,13 +202,15 @@ The parameters relevant for this information are described below.
 
 #### 5.1.1. `SHARE=SERVICE/A`
 
-This parameter takes the form of `//server-name/share-name` or `//server-name:port-number/share-name`.
+This parameter takes the form of `//server-name/share-name` or `//server-name:port-number/share-name`. You can also use the SMB URI form
+`smb://[[workgroup;]user-name[:password]@]server-name[:port-number]/share`.
 
-For example `//sourcery/all`, `//192.168.0.1/all`, `//nas:445/files`, `//nas:microsoft-ds/files` would all be valid `SHARE` parameters.
+For example `//sourcery/all`, `//192.168.0.1/all`, `//nas:445/files`, `//nas:microsoft-ds/files`, `smb://sourcery/all`, `smb://user@sourcery/all`
+and `smb://user:password@sourcery/all` would all be valid `SHARE` parameters.
 
-In this example `server-name` must be either the IPv4 address of the file server to connect to, or the name of the server (note that server names cannot be longer than 16 characters).
+In this example `server-name` must be either the IPv4 address of the file server to connect to, or the name of the server (**note that server names cannot be longer than 16 characters**).
 
-If necessary, you can specify which port number should be used when making the connection. The port number is optional, though. In place of the port (e.g. 445) number you can also use the name of a TCP/UDP service (e.g. "microsoft-ds").
+If necessary, you can specify which port number should be used when making the connection. The port number is optional, though. In place of the port (e.g. 445) number you can also use the name of a TCP/UDP service (e.g. `microsoft-ds`).
 
 Finally, you need to tell the *SMB* server which service you want to connect to, which for the **smbfs** program should be the name of a shared network file system. In the example the name of the shared network file system would be `share-name`.
 
@@ -215,7 +220,7 @@ Unless you use the `VOLUMENAME` option (e.g. `VOLUMENAME=MyData`), **smbfs** wil
 
 In order to connect to an *SMB* share, the server requires that a user name is provided. If you omit the user name, the **smbfs** program will use `GUEST` as a replacement.
 
-If you do provide a user name, it must not be longer than 63 characters. Unless you use the `CHANGEUSERNAMECASE=NO` option the name you provide will be translated to all upper case characters.
+If you do provide a user name, **it must not be longer than 63 characters**. Unless you use the `CHANGEUSERNAMECASE=NO` option the name you provide will be translated to all upper case characters.
 
 You need not provide for a user name on the command line. Alternatively, you may configure an environment variable whose contents will be used instead. The variable could be set up like this:
 
@@ -267,7 +272,7 @@ However, it may be required to change the password to all-uppercase characters b
 
 This option may be omitted, in which case the **smbfs** program will ask the file server about the work group which it is a member of. Should the server fail to respond with this information, the **smbfs** program will use `WORKGROUP` as the domain name.
 
-You should not need to specify the name of the work group or domain which the file server to connect to is a member of. However, if you do need to use it, you must make sure that the name is not longer than 16 characters. The name you provide will be translated to all upper case characters.
+You should not need to specify the name of the work group or domain which the file server to connect to is a member of. However, if you do need to use it, you must **make sure that the name is not longer than 16 characters**. The name you provide will be translated to all upper case characters.
 
 You need not provide for a work group or domain name on the command line. Alternatively, you may configure an environment variable whose contents will be used instead. The variable could be set up like this:
 
@@ -292,7 +297,7 @@ In some cases this may be undesirable as the computer's name differs from what t
 
 You can use the `CLIENT` parameter to tell **smbfs** under which name it should announce itself to the server.
 
-This parameter is optional and will be translated to all upper case characters; it cannot be longer than 16 characters.
+This parameter is optional and will be translated to all upper case characters; **it cannot be longer than 16 characters**.
 
 Please note that the `CLIENT` parameter will be ignored unless the `NETBIOS` switch is used, too.
 
@@ -302,7 +307,7 @@ Please note that the `CLIENT` parameter will be ignored unless the `NETBIOS` swi
 
 In some cases this may be undesirable as the server's name differs from what you specified as the share name. You can use the `SERVER` parameter to tell **smbfs** under which name it should contact the server.
 
-This parameter is optional and will be translated to all upper case characters; it cannot be longer than 16 characters.
+This parameter is optional and will be translated to all upper case characters; **it cannot be longer than 16 characters**.
 
 Please note that the `SERVER` parameter will be ignored unless the `NETBIOS` switch is used, too.
 
@@ -320,7 +325,7 @@ Also note that file and drawer names which cannot be represented on the Amiga du
 
 The built-in default translation method is restricted to the part of Unicode which is covered by the *ISO-8859-1* character set. It is enabled by default, as if `UNICODE=on` had been used. You can disable it with `UNICODE=off`, which completely disables the translation.
 
-Note: some *Samba* versions will return corrupted file and drawer names unless Unicode support is enabled. Names which use only US-ASCII characters appear to be generally safe to use and are unlikely to suffer from corruption.
+**Note**: Some *Samba* versions will return corrupted file and drawer names unless Unicode support is enabled. Names which use only US-ASCII characters appear to be generally safe to use and are unlikely to suffer from corruption.
 
 #### 5.2.2. `CP437/S`
 
@@ -358,23 +363,29 @@ This information is stored in a cache which by default will hold up to 170 entri
 
 You may want to change this requirement, by making the cache smaller or larger using the `CACHESIZE` parameter. The size of the cache cannot be smaller than 10 entries.
 
-#### 5.3.2. `RAISEPRIORITY/S`
+#### 5.3.2. `CACHETABLES/N/K`
+
+The cache can be used only by one directory at a time, which can cause problems if you are trying to delete a complete directory hierarchy, with several subdirectories (and their respective subdirectories). The cache will have to be refilled for each directory currently being processed. Consequently, **smbfs** will lose track of where it was when it read from the previous directory it was dealing with and must start over again.
+
+You can mitigate these effects by increasing the number of caches which **smbfs** may use at a time. By default only a single cache, for a single directory, will be active (`CACHETABLES=1`). You can use more directory caches if you want to, but keep in mind that each cache will consume extra memory. If you want to use multiple caches, you might want to reduce the cache size.
+
+#### 5.3.3. `RAISEPRIORITY/S`
 
 The **smbfs** program can be run at a higher priority than it would normally do (normal would be priority 0), which might increase performance, but raise system load, too. If the `RAISEPRIORITY` switch is used, the **smbfs** program will run at the same priority as other Amiga file systems do (this would be priority 10).
 
-#### 5.3.3. `TIMEOUT/N/K`
+#### 5.3.4. `TIMEOUT/N/K`
 
 The **smbfs** program may lose the connection to the server during file system operations. While it will try to reestablish a connection to the server, some time has to pass before it becomes clear that the server connection is no longer working correctly.
 
 You can set the number of seconds which have to pass before the **smbfs** program will stop waiting for the server to respond, shut down the connection and try again. For example, `TIMEOUT=5` will select a timeout of 5 seconds.
 
-#### 5.3.4. `WRITEBEHIND/S`
+#### 5.3.5. `WRITEBEHIND/S`
 
 The **smbfs** program can try to improve write performance by not waiting for the server to confirm that all the data just transmitted has in fact been stored. There is a risk involved in that the server may not have been able to store the data and you will never know about it.
 
 Please note that the `WRITEBEHIND` switch has no effect if `PROTOCOL=nt1` is used because the **smbfs** program will then be using a different server write command which does not support the "write behind" functionality.
 
-#### 5.3.5. `READTHRESHOLD/N/K` and `WRITETHRESHOLD/N/K`
+#### 5.3.6. `READTHRESHOLD/N/K` and `WRITETHRESHOLD/N/K`
 
 The purpose of **smbfs** is chiefly to enable you to read and write files stored on a networked computer. To this end **smbfs** tries its best to squeeze as much performance out of the data transmission as possible.
 
@@ -418,13 +429,19 @@ To avoid problems with such software, the **smbfs** program can be made to prete
 
 Please note that if the `DISABLEEXALL` switch is used, the **smbfs** program will make files and drawers appear to be "hidden" if their names are longer than 107 characters.
 
-#### 5.4.3. `MAXNAMELEN/N/K`
+#### 5.4.3. `ERROROUTPUT/K`
+
+The **smbfs** program will try to print error messages in the shell window in a manner which bypasses output redirection. This means that if you decide to discard all the output by sending it to `NIL:`, then smbfs will still be able to show you error messages.
+
+Where this is not a useful feature, you can tell the smbfs program to print both normal output and error messages in the same manner: use the `ERROROUTPUT=stdout` option.
+
+#### 5.4.4. `MAXNAMELEN/N/K`
 
 Some Amiga programs struggle with file and drawer names longer than 30 characters. They may malfunction and even crash when the **smbfs** program delivers them.
 
 You can tell the **smbfs** program not to deliver any file or drawer names which are longer than a certain number of characters using the `MAXNAMELEN` option. For example, `MAXNAMELEN=30` would make files and drawers appear to be "hidden" if their names are longer than 30 characters.
 
-#### 5.4.4. `MAXTRANSMIT/N/K`
+#### 5.4.5. `MAXTRANSMIT/N/K`
 
 You can fine-tune the size of the transmission buffer which the **smbfs** program uses when reading and writing files. The server may not have picked a buffer size which suits **smbfs** well. You can choose a smaller buffer size, if needed.
 
@@ -432,7 +449,7 @@ The minimum transmission buffer size is 8000 bytes (this is also the default buf
 
 Please note that the transmission buffer size you asked for need not be accepted by the file server, which may choose to use a much smaller buffer.
 
-#### 5.4.5. `PROTOCOL/K`
+#### 5.4.6. `PROTOCOL/K`
 
 The **smbfs** program talks to the file server using a protocol called **SMBv1**, using commands and data structures described by the **Common Internet File System** documentation.
 
@@ -444,7 +461,7 @@ The alternative is `PROTOCOL=nt1` which might provide better compatibility and p
 
 When in doubt, stick with `PROTOCOL=core`.
 
-#### 5.4.6. `SESSIONSETUP/K`
+#### 5.4.7. `SESSIONSETUP/K`
 
 If the `UNICODE=ON` option is in effect, the **smbfs** program may not be able to connect to the server because it expects Unicode text to be used only after the server session has been established.
 
@@ -489,7 +506,15 @@ You can tell **smbfs** not to add a volume, which may be useful because the nati
 If you want to use a specific volume name, use the `VOLUME` option,
 e.g. `VOLUME=Sourcery:`. Otherwise a volume name derived from the share name will be used instead.
 
-#### 5.6.2. `OMITHIDDEN/S`
+#### 5.6.2. `READONLY/S`
+
+If you want to make sure that the contents of the file system mounted cannot
+be modified or deleted by mistake, use the `READONLY` switch. This switch has
+the same effect as using the `Lock` shell command. However, this protection
+against modification will be enabled as soon as the file system has been
+mounted and the protection cannot be removed with the `Lock` shell command.
+
+#### 5.6.3. `OMITHIDDEN/S`
 
 When requesting a directory listing, the file server may return some files and drawers tagged as being hidden. By default **smbfs** will not treat these "hidden" entries any different from the other directory entries, i.e. they are not hidden from view.
 
@@ -497,14 +522,14 @@ You can request that the hidden entries should be omitted from directory listing
 
 Note that even though a file or drawer may be hidden, you should still be able to open and examine it.
 
-#### 5.6.3. `QUIET/S`
+#### 5.6.4. `QUIET/S`
 
 When started from shell, the **smbfs** program will print a message as soon as the
 connection to the file server has been established.
 
 If you do not want to see that message displayed, use the `QUIET` parameter. Please note that the **smbfs** program may still show error messages.
 
-#### 5.6.4. `SETENV/S`
+#### 5.6.5. `SETENV/S`
 
 You may want to stop or disable/re-enabled a currently running **smbfs** program through the shell `Break` command, but it may be impractical to figure out which CLI process number is involved.
 
